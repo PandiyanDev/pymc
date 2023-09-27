@@ -316,7 +316,12 @@ class TestMatchesScipy:
             f_logp(cov_val, np.ones(2))
         dlogp = pt.grad(mvn_logp, cov)
         f_dlogp = pytensor.function([cov, x], dlogp)
-        assert not np.all(np.isfinite(f_dlogp(cov_val, np.ones(2))))
+        try:
+            res = f_dlogp(cov_val, np.ones(2))
+        except ValueError:
+            pass  # Op raises internally
+        else:
+            assert not np.all(np.isfinite(res))  # Otherwise, should return nan
 
     def test_mvnormal_init_fail(self):
         with pm.Model():
@@ -830,6 +835,27 @@ def test_car_matrix_check(sparse):
             car_dist = pm.CAR.dist(mu, W, alpha, tau)
 
 
+@pytest.mark.parametrize("alpha", [1, -1])
+def test_car_alpha_bounds(alpha):
+    """
+    Tests the check that -1 < alpha < 1
+    """
+
+    W = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]])
+
+    tau = 1
+    mu = np.array([0, 0, 0])
+    values = np.array([-0.5, 0, 0.5])
+
+    car_dist = pm.CAR.dist(W=W, alpha=alpha, mu=mu, tau=tau)
+
+    with pytest.raises(ValueError, match="the domain of alpha is: -1 < alpha < 1"):
+        pm.draw(car_dist)
+
+    with pytest.raises(ValueError, match="-1 < alpha < 1, tau > 0"):
+        pm.logp(car_dist, values).eval()
+
+
 class TestLKJCholeskCov:
     def test_dist(self):
         sd_dist = pm.Exponential.dist(1, size=(10, 3))
@@ -1053,6 +1079,18 @@ class TestMoments:
         alpha = 0.5
         with pm.Model() as model:
             pm.CAR("x", mu=mu, W=W, alpha=alpha, tau=tau, size=size)
+        assert_moment_is_expected(model, expected)
+
+    @pytest.mark.parametrize(
+        "W, expected",
+        [
+            (np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]]), np.array([0, 0, 0])),
+            (np.array([[0, 1], [1, 0]]), np.array([0, 0])),
+        ],
+    )
+    def test_icar_moment(self, W, expected):
+        with pm.Model() as model:
+            RV = pm.ICAR("x", W=W)
         assert_moment_is_expected(model, expected)
 
     @pytest.mark.parametrize(
@@ -1558,7 +1596,7 @@ class TestZeroSumNormal:
             (5, 3, None, [-1]),
             (2, 6, None, [-1]),
             (5, (7, 3), None, [-1]),
-            (5, (2, 7, 3), 2, [1, 2]),
+            (5, (2, 7, 3), 2, [-2, -1]),
         ],
     )
     def test_zsn_logp(self, sigma, shape, n_zerosum_axes, mvn_axes):
@@ -1591,10 +1629,17 @@ class TestZeroSumNormal:
             return np.where(inds, np.sum(-psdet - exp, axis=-1), -np.inf)
 
         zsn_dist = pm.ZeroSumNormal.dist(sigma=sigma, shape=shape, n_zerosum_axes=n_zerosum_axes)
-        zsn_logp = pm.logp(zsn_dist, value=np.zeros(shape)).eval()
-        mvn_logp = logp_norm(value=np.zeros(shape), sigma=sigma, axes=mvn_axes)
+        zsn_draws = pm.draw(zsn_dist, 100)
+        zsn_logp = pm.logp(zsn_dist, value=zsn_draws).eval()
+        mvn_logp = logp_norm(value=zsn_draws, sigma=sigma, axes=mvn_axes)
 
         np.testing.assert_allclose(zsn_logp, mvn_logp)
+
+    def test_does_not_upcast_to_float64(self):
+        with pytensor.config.change_flags(floatX="float32", warn_float64="raise"):
+            with pm.Model() as m:
+                pm.ZeroSumNormal("b", sigma=1, shape=(2,))
+            m.logp()
 
 
 class TestMvStudentTCov(BaseTestDistributionRandom):
@@ -1881,26 +1926,22 @@ class TestMatrixNormal(BaseTestDistributionRandom):
         def ref_rand(mu, rowcov, colcov):
             return st.matrix_normal.rvs(mean=mu, rowcov=rowcov, colcov=colcov)
 
-        with pm.Model():
-            matrixnormal = pm.MatrixNormal(
-                "matnormal",
-                mu=np.random.random((3, 3)),
-                rowcov=np.eye(3),
-                colcov=np.eye(3),
-            )
-            check = pm.sample_prior_predictive(n_fails, return_inferencedata=False, random_seed=1)
-
-        ref_smp = ref_rand(mu=np.random.random((3, 3)), rowcov=np.eye(3), colcov=np.eye(3))
+        matrixnormal = pm.MatrixNormal.dist(
+            mu=np.random.random((3, 3)),
+            rowcov=np.eye(3),
+            colcov=np.eye(3),
+        )
 
         p, f = delta, n_fails
         while p <= delta and f > 0:
-            matrixnormal_smp = check["matnormal"]
+            matrixnormal_smp = pm.draw(matrixnormal)
+            ref_smp = ref_rand(mu=np.random.random((3, 3)), rowcov=np.eye(3), colcov=np.eye(3))
 
             p = np.min(
                 [
                     st.ks_2samp(
-                        np.atleast_1d(matrixnormal_smp).flatten(),
-                        np.atleast_1d(ref_smp).flatten(),
+                        matrixnormal_smp.flatten(),
+                        ref_smp.flatten(),
                     )
                 ]
             )
@@ -1946,7 +1987,7 @@ class TestKroneckerNormal(BaseTestDistributionRandom):
     def kronecker_rng_fn(self, size, mu, covs=None, sigma=None, rng=None):
         cov = pm.math.kronecker(covs[0], covs[1]).eval()
         cov += sigma**2 * np.identity(cov.shape[0])
-        return st.multivariate_normal.rvs(mean=mu, cov=cov, size=size)
+        return st.multivariate_normal.rvs(mean=mu, cov=cov, size=size, random_state=rng)
 
     pymc_dist = pm.KroneckerNormal
 
@@ -2065,6 +2106,66 @@ class TestLKJCholeskyCov(BaseTestDistributionRandom):
         assert np.all(np.abs(draw(x, random_seed=rng) - np.array([0.5, 0, 2.0])) < 0.01)
 
 
+class TestICAR(BaseTestDistributionRandom):
+    pymc_dist = pm.ICAR
+    pymc_dist_params = {"W": np.array([[0, 1, 1], [1, 0, 1], [1, 1, 0]]), "sigma": 2}
+    expected_rv_op_params = {
+        "W": np.array([[0, 1, 1], [1, 0, 1], [1, 1, 0]]),
+        "node1": np.array([1, 2, 2]),
+        "node2": np.array([0, 0, 1]),
+        "N": 3,
+        "sigma": 2,
+        "zero_sum_strength": 0.001,
+    }
+    checks_to_run = ["check_pymc_params_match_rv_op", "check_rv_inferred_size"]
+
+    def check_rv_inferred_size(self):
+        sizes_to_check = [None, (), 1, (1,), 5, (4, 5), (2, 4, 2)]
+        sizes_expected = [(3,), (3,), (1, 3), (1, 3), (5, 3), (4, 5, 3), (2, 4, 2, 3)]
+        for size, expected in zip(sizes_to_check, sizes_expected):
+            pymc_rv = self.pymc_dist.dist(**self.pymc_dist_params, size=size)
+            expected_symbolic = tuple(pymc_rv.shape.eval())
+            assert expected_symbolic == expected
+
+    def test_icar_logp(self):
+        W = np.array([[0, 1, 0, 1], [1, 0, 1, 0], [0, 1, 0, 1], [1, 0, 1, 0]])
+
+        with pm.Model() as m:
+            RV = pm.ICAR("phi", W=W)
+
+        assert pt.isclose(
+            pm.logp(RV, np.array([0.01, -0.03, 0.02, 0.00])).eval(), np.array(4.60022238)
+        ).eval(), "logp inaccuracy"
+
+    def test_icar_rng_fn(self):
+        W = np.array([[0, 1, 0, 1], [1, 0, 1, 0], [0, 1, 0, 1], [1, 0, 1, 0]])
+
+        RV = pm.ICAR.dist(W=W)
+
+        with pytest.raises(NotImplementedError, match="Cannot sample from ICAR prior"):
+            pm.draw(RV)
+
+    @pytest.mark.parametrize(
+        "W,msg",
+        [
+            (np.array([0, 1, 0, 0]), "W must be matrix with ndim=2"),
+            (np.array([[0, 1, 0, 0], [1, 0, 0, 1], [1, 0, 0, 1]]), "W must be a square matrix"),
+            (
+                np.array([[0, 1, 0, 0], [1, 0, 0, 1], [1, 0, 0, 1], [0, 1, 1, 0]]),
+                "W must be a symmetric matrix",
+            ),
+            (
+                np.array([[0, 1, 1, 0], [1, 0, 0, 0.5], [1, 0, 0, 1], [0, 0.5, 1, 0]]),
+                "W must be composed of only 1s and 0s",
+            ),
+        ],
+    )
+    def test_icar_matrix_checks(self, W, msg):
+        with pytest.raises(ValueError, match=msg):
+            with pm.Model():
+                pm.ICAR("phi", W=W)
+
+
 @pytest.mark.parametrize("sparse", [True, False])
 def test_car_rng_fn(sparse):
     delta = 0.05  # limit for KS p-value
@@ -2108,10 +2209,10 @@ def test_car_rng_fn(sparse):
 @pytest.mark.parametrize(
     "matrix, result",
     [
-        ([[1.0, 0], [0, 1]], 1),
-        ([[1.0, 2], [2, 1]], 0),
-        ([[1.0, 1], [1, 1]], 0),
-        ([[1, 0.99, 1], [0.99, 1, 0.999], [1, 0.999, 1]], 0),
+        ([[1.0, 0], [0, 1]], True),
+        ([[1.0, 2], [2, 1]], False),
+        ([[1.0, 1], [1, 1]], False),
+        ([[1, 0.99, 1], [0.99, 1, 0.999], [1, 0.999, 1]], False),
     ],
 )
 def test_posdef_symmetric(matrix, result):

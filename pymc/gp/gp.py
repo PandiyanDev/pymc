@@ -14,25 +14,27 @@
 
 import warnings
 
+from functools import partial
+
 import numpy as np
 import pytensor.tensor as pt
 
-from pytensor.tensor.nlinalg import eigh
+from pytensor.tensor.linalg import cholesky, eigh, solve_triangular
 
 import pymc as pm
 
-from pymc.gp.cov import Constant, Covariance
+from pymc.gp.cov import BaseCovariance, Constant
 from pymc.gp.mean import Zero
 from pymc.gp.util import (
     JITTER_DEFAULT,
-    cholesky,
     conditioned_vars,
     replace_with_values,
-    solve_lower,
-    solve_upper,
     stabilize,
 )
 from pymc.math import cartesian, kron_diag, kron_dot, kron_solve_lower, kron_solve_upper
+
+solve_lower = partial(solve_triangular, lower=True)
+solve_upper = partial(solve_triangular, lower=False)
 
 __all__ = ["Latent", "Marginal", "TP", "MarginalApprox", "LatentKron", "MarginalKron"]
 
@@ -483,7 +485,7 @@ class Marginal(Base):
         """
         sigma = _handle_sigma_noise_parameters(sigma=sigma, noise=noise)
 
-        noise_func = sigma if isinstance(sigma, Covariance) else pm.gp.cov.WhiteNoise(sigma)
+        noise_func = sigma if isinstance(sigma, BaseCovariance) else pm.gp.cov.WhiteNoise(sigma)
         mu, cov = self._build_marginal_likelihood(X=X, noise_func=noise_func, jitter=jitter)
         self.X = X
         self.y = y
@@ -515,7 +517,7 @@ class Marginal(Base):
 
         if all(val in given for val in ["X", "y", "sigma"]):
             X, y, sigma = given["X"], given["y"], given["sigma"]
-            noise_func = sigma if isinstance(sigma, Covariance) else pm.gp.cov.WhiteNoise(sigma)
+            noise_func = sigma if isinstance(sigma, BaseCovariance) else pm.gp.cov.WhiteNoise(sigma)
         else:
             X, y, noise_func = self.X, self.y, self.sigma
         return X, y, noise_func, cov_total, mean_total

@@ -25,16 +25,17 @@ import numpy as np
 
 from pytensor import tensor as pt
 from pytensor.compile.builders import OpFromGraph
-from pytensor.graph import node_rewriter
+from pytensor.graph import FunctionGraph, node_rewriter
 from pytensor.graph.basic import Node, Variable
 from pytensor.graph.replace import clone_replace
 from pytensor.graph.rewriting.basic import in2out
 from pytensor.graph.utils import MetaType
 from pytensor.tensor.basic import as_tensor_variable
 from pytensor.tensor.random.op import RandomVariable
-from pytensor.tensor.random.type import RandomType
+from pytensor.tensor.random.rewriting import local_subtensor_rv_lift
 from pytensor.tensor.random.utils import normalize_size_param
-from pytensor.tensor.var import TensorVariable
+from pytensor.tensor.rewriting.shape import ShapeFeature
+from pytensor.tensor.variable import TensorVariable
 from typing_extensions import TypeAlias
 
 from pymc.distributions.shape_utils import (
@@ -45,26 +46,28 @@ from pymc.distributions.shape_utils import (
     convert_shape,
     convert_size,
     find_size,
+    rv_size_is_none,
     shape_from_dims,
 )
 from pymc.exceptions import BlockModelAccessError
-from pymc.logprob.abstract import (
-    MeasurableVariable,
-    _get_measurable_outputs,
-    _icdf,
-    _logcdf,
-    _logprob,
-)
+from pymc.logprob.abstract import MeasurableVariable, _icdf, _logcdf, _logprob
+from pymc.logprob.basic import logp
 from pymc.logprob.rewriting import logprob_rewrites_db
-from pymc.model import BlockModelAccess
+from pymc.model.core import new_or_existing_block_model_access
 from pymc.printing import str_for_dist
-from pymc.pytensorf import collect_default_updates, convert_observed_data
+from pymc.pytensorf import (
+    collect_default_updates,
+    constant_fold,
+    convert_observed_data,
+    floatX,
+)
 from pymc.util import UNSET, _add_future_warning_tag
-from pymc.vartypes import string_types
+from pymc.vartypes import continuous_types, string_types
 
 __all__ = [
     "CustomDist",
     "DensityDist",
+    "DiracDelta",
     "Distribution",
     "Continuous",
     "Discrete",
@@ -201,6 +204,7 @@ class SymbolicRandomVariable(OpFromGraph):
     """Tuple of (name, latex name) used for for pretty-printing variables of this type"""
 
     def __init__(self, *args, ndim_supp, **kwargs):
+        """Initialitze a SymbolicRandomVariable class."""
         self.ndim_supp = ndim_supp
         kwargs.setdefault("inline", True)
         super().__init__(*args, **kwargs)
@@ -399,20 +403,6 @@ class Distribution(metaclass=DistributionMeta):
 MeasurableVariable.register(SymbolicRandomVariable)
 
 
-@_get_measurable_outputs.register(SymbolicRandomVariable)
-def _get_measurable_outputs_symbolic_random_variable(op, node):
-    # This tells PyMC that any non RandomType outputs are measurable
-
-    # Assume that if there is one default_output, that's the only one that is measurable
-    # In the rare case this is not what one wants, a specialized _get_measuarable_outputs
-    # can dispatch for a subclassed Op
-    if op.default_output is not None:
-        return [node.default_output()]
-
-    # Otherwise assume that any outputs that are not of RandomType are measurable
-    return [out for out in node.outputs if not isinstance(out.type, RandomType)]
-
-
 @node_rewriter([SymbolicRandomVariable])
 def inline_symbolic_random_variable(fgraph, node):
     """
@@ -498,6 +488,11 @@ class _CustomDist(Distribution):
         class_name: str = "CustomDist",
         **kwargs,
     ):
+        if ndim_supp > 0:
+            raise NotImplementedError(
+                "CustomDist with ndim_supp > 0 and without a `dist` function are not supported."
+            )
+
         dist_params = [as_tensor_variable(param) for param in dist_params]
 
         # Assume scalar ndims_params
@@ -594,7 +589,7 @@ class CustomSymbolicDistRV(SymbolicRandomVariable):
     def update(self, node: Node):
         op = node.op
         inner_updates = collect_default_updates(
-            op.inner_inputs, op.inner_outputs, must_be_shared=False
+            inputs=op.inner_inputs, outputs=op.inner_outputs, must_be_shared=False
         )
 
         # Map inner updates to outer inputs/outputs
@@ -619,7 +614,7 @@ class _CustomSymbolicDist(Distribution):
         moment: Optional[Callable] = None,
         ndim_supp: int = 0,
         dtype: str = "floatX",
-        class_name: str = "CustomSymbolicDist",
+        class_name: str = "CustomDist",
         **kwargs,
     ):
         dist_params = [as_tensor_variable(param) for param in dist_params]
@@ -661,12 +656,12 @@ class _CustomSymbolicDist(Distribution):
         size = normalize_size_param(size)
         dummy_size_param = size.type()
         dummy_dist_params = [dist_param.type() for dist_param in dist_params]
-        with BlockModelAccess(
+        with new_or_existing_block_model_access(
             error_msg_on_access="Model variables cannot be created in the dist function. Use the `.dist` API"
         ):
             dummy_rv = dist(*dummy_dist_params, dummy_size_param)
         dummy_params = [dummy_size_param] + dummy_dist_params
-        dummy_updates_dict = collect_default_updates(dummy_params, (dummy_rv,))
+        dummy_updates_dict = collect_default_updates(inputs=dummy_params, outputs=(dummy_rv,))
 
         rv_type = type(
             class_name,
@@ -711,7 +706,7 @@ class _CustomSymbolicDist(Distribution):
             dummy_dist_params = [dist_param.type() for dist_param in old_dist_params]
             dummy_rv = dist(*dummy_dist_params, dummy_size_param)
             dummy_params = [dummy_size_param] + dummy_dist_params
-            dummy_updates_dict = collect_default_updates(dummy_params, (dummy_rv,))
+            dummy_updates_dict = collect_default_updates(inputs=dummy_params, outputs=(dummy_rv,))
             new_rv_op = rv_type(
                 inputs=dummy_params,
                 outputs=[*dummy_updates_dict.values(), dummy_rv],
@@ -970,7 +965,7 @@ class CustomDist:
         dist_params = cls.parse_dist_params(dist_params)
         cls.check_valid_dist_random(dist, random, dist_params)
         if dist is not None:
-            kwargs.setdefault("class_name", f"CustomSymbolicDist_{name}")
+            kwargs.setdefault("class_name", f"CustomDist_{name}")
             return _CustomSymbolicDist(
                 name,
                 *dist_params,
@@ -1064,7 +1059,7 @@ class CustomDist:
         # Try calling random with symbolic inputs
         try:
             size = normalize_size_param(None)
-            with BlockModelAccess(
+            with new_or_existing_block_model_access(
                 error_msg_on_access="Model variables cannot be created in the random function. Use the `.dist` API to create such variables."
             ):
                 out = random(*dist_params, size)
@@ -1105,3 +1100,203 @@ def default_moment(rv, size, *rv_inputs, rv_name=None, has_fallback=False, ndim_
             f"Please provide a moment function when instantiating the {rv_name} "
             "random variable."
         )
+
+
+class DiracDeltaRV(RandomVariable):
+    name = "diracdelta"
+    ndim_supp = 0
+    ndims_params = [0]
+    _print_name = ("DiracDelta", "\\operatorname{DiracDelta}")
+
+    def make_node(self, rng, size, dtype, c):
+        c = pt.as_tensor_variable(c)
+        return super().make_node(rng, size, c.dtype, c)
+
+    @classmethod
+    def rng_fn(cls, rng, c, size=None):
+        if size is None:
+            return c.copy()
+        return np.full(size, c)
+
+
+diracdelta = DiracDeltaRV()
+
+
+class DiracDelta(Discrete):
+    r"""
+    DiracDelta log-likelihood.
+
+    Parameters
+    ----------
+    c : tensor_like of float or int
+        Dirac Delta parameter. The dtype of `c` determines the dtype of the distribution.
+        This can affect which sampler is assigned to DiracDelta variables, or variables
+        that use DiracDelta, such as Mixtures.
+    """
+
+    rv_op = diracdelta
+
+    @classmethod
+    def dist(cls, c, *args, **kwargs):
+        c = pt.as_tensor_variable(c)
+        if c.dtype in continuous_types:
+            c = floatX(c)
+        return super().dist([c], **kwargs)
+
+    def moment(rv, size, c):
+        if not rv_size_is_none(size):
+            c = pt.full(size, c)
+        return c
+
+    def logp(value, c):
+        return pt.switch(
+            pt.eq(value, c),
+            pt.zeros_like(value),
+            -np.inf,
+        )
+
+    def logcdf(value, c):
+        return pt.switch(
+            pt.lt(value, c),
+            -np.inf,
+            0,
+        )
+
+
+class PartialObservedRV(SymbolicRandomVariable):
+    """RandomVariable with partially observed subspace, as indicated by a boolean mask.
+
+    See `create_partial_observed_rv` for more details.
+    """
+
+
+def create_partial_observed_rv(
+    rv: TensorVariable,
+    mask: Union[np.ndarray, TensorVariable],
+) -> Tuple[
+    Tuple[TensorVariable, TensorVariable], Tuple[TensorVariable, TensorVariable], TensorVariable
+]:
+    """Separate observed and unobserved components of a RandomVariable.
+
+    This function may return two independent RandomVariables or, if not possible,
+    two variables from a common `PartialObservedRV` node
+
+    Parameters
+    ----------
+    rv : TensorVariable
+    mask : tensor_like
+        Constant or variable boolean mask. True entries correspond to components of the variable that are not observed.
+
+    Returns
+    -------
+    observed_rv and mask : Tuple of TensorVariable
+        The observed component of the RV and respective indexing mask
+    unobserved_rv and mask : Tuple of TensorVariable
+        The unobserved component of the RV and respective indexing mask
+    joined_rv : TensorVariable
+        The symbolic join of the observed and unobserved components.
+    """
+    if not mask.dtype == "bool":
+        raise ValueError(
+            f"mask must be an array or tensor of boolean dtype, got dtype: {mask.dtype}"
+        )
+
+    if mask.ndim > rv.ndim:
+        raise ValueError(f"mask can't have more dims than rv, got ndim: {mask.ndim}")
+
+    antimask = ~mask
+
+    can_rewrite = False
+    # Only pure RVs can be rewritten
+    if isinstance(rv.owner.op, RandomVariable):
+        ndim_supp = rv.owner.op.ndim_supp
+
+        # All univariate RVs can be rewritten
+        if ndim_supp == 0:
+            can_rewrite = True
+
+        # Multivariate RVs can be rewritten if masking does not split within support dimensions
+        else:
+            batch_dims = rv.type.ndim - ndim_supp
+            constant_mask = getattr(as_tensor_variable(mask), "data", None)
+
+            # Indexing does not overlap with core dimensions
+            if mask.ndim <= batch_dims:
+                can_rewrite = True
+
+            # Try to handle special case where mask is constant across support dimensions,
+            # TODO: This could be done by the rewrite itself
+            elif constant_mask is not None:
+                # We check if a constant_mask that only keeps the first entry of each support dim
+                # is equivalent to the original one after re-expanding.
+                trimmed_mask = constant_mask[(...,) + (0,) * ndim_supp]
+                expanded_mask = np.broadcast_to(
+                    np.expand_dims(trimmed_mask, axis=tuple(range(-ndim_supp, 0))),
+                    shape=constant_mask.shape,
+                )
+                if np.array_equal(constant_mask, expanded_mask):
+                    mask = trimmed_mask
+                    antimask = ~trimmed_mask
+                    can_rewrite = True
+
+    if can_rewrite:
+        masked_rv = rv[mask]
+        fgraph = FunctionGraph(outputs=[masked_rv], clone=False, features=[ShapeFeature()])
+        [unobserved_rv] = local_subtensor_rv_lift.transform(fgraph, fgraph.outputs[0].owner)
+
+        antimasked_rv = rv[antimask]
+        fgraph = FunctionGraph(outputs=[antimasked_rv], clone=False, features=[ShapeFeature()])
+        [observed_rv] = local_subtensor_rv_lift.transform(fgraph, fgraph.outputs[0].owner)
+
+        # Make a clone of the observedRV, with a distinct rng so that observed and
+        # unobserved are never treated as equivalent (and mergeable) nodes by pytensor.
+        _, size, _, *inps = observed_rv.owner.inputs
+        observed_rv = observed_rv.owner.op(*inps, size=size)
+
+    # For all other cases use the more general PartialObservedRV
+    else:
+        # The symbolic graph simply splits the observed and unobserved components,
+        # so they can be given separate values.
+        dist_, mask_ = rv.type(), as_tensor_variable(mask).type()
+        observed_rv_, unobserved_rv_ = dist_[~mask_], dist_[mask_]
+
+        observed_rv, unobserved_rv = PartialObservedRV(
+            inputs=[dist_, mask_],
+            outputs=[observed_rv_, unobserved_rv_],
+            ndim_supp=rv.owner.op.ndim_supp,
+        )(rv, mask)
+
+    joined_rv = pt.empty(rv.shape, dtype=rv.type.dtype)
+    joined_rv = pt.set_subtensor(joined_rv[mask], unobserved_rv)
+    joined_rv = pt.set_subtensor(joined_rv[antimask], observed_rv)
+
+    return (observed_rv, antimask), (unobserved_rv, mask), joined_rv
+
+
+@_logprob.register(PartialObservedRV)
+def partial_observed_rv_logprob(op, values, dist, mask, **kwargs):
+    # For the logp, simply join the values
+    [obs_value, unobs_value] = values
+    antimask = ~mask
+    joined_value = pt.empty(constant_fold([dist.shape])[0])
+    joined_value = pt.set_subtensor(joined_value[mask], unobs_value)
+    joined_value = pt.set_subtensor(joined_value[antimask], obs_value)
+    joined_logp = logp(dist, joined_value)
+
+    # If we have a univariate RV we can split apart the logp terms
+    if op.ndim_supp == 0:
+        return joined_logp[antimask], joined_logp[mask]
+    # Otherwise, we can't (always/ easily) split apart logp terms.
+    # We return the full logp for the observed value, and a 0-nd array for the unobserved value
+    else:
+        return joined_logp.ravel(), pt.zeros((0,), dtype=joined_logp.type.dtype)
+
+
+@_moment.register(PartialObservedRV)
+def partial_observed_rv_moment(op, partial_obs_rv, rv, mask):
+    # Unobserved output
+    if partial_obs_rv.owner.outputs.index(partial_obs_rv) == 1:
+        return moment(rv)[mask]
+    # Observed output
+    else:
+        return moment(rv)[~mask]

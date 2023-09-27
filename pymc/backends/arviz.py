@@ -46,7 +46,7 @@ if TYPE_CHECKING:
 
 ___all__ = [""]
 
-_log = logging.getLogger("pymc")
+_log = logging.getLogger(__name__)
 
 # random variable object ...
 Var = Any  # pylint: disable=invalid-name
@@ -98,6 +98,18 @@ def find_constants(model: "Model") -> Dict[str, Var]:
             constant_data[name] = var
 
     return constant_data
+
+
+def coords_and_dims_for_inferencedata(model: Model) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Parse PyMC model coords and dims format to one accepted by InferenceData."""
+    coords = {
+        cname: np.array(cvals) if isinstance(cvals, tuple) else cvals
+        for cname, cvals in model.coords.items()
+        if cvals is not None
+    }
+    dims = {dname: list(dvals) for dname, dvals in model.named_vars_to_dims.items()}
+
+    return coords, dims
 
 
 class _DefaultTrace:
@@ -216,19 +228,11 @@ class InferenceDataConverter:  # pylint: disable=too-many-instance-attributes
                 " one of trace, prior, posterior_predictive or predictions."
             )
 
-        # Make coord types more rigid
-        untyped_coords: Dict[str, Optional[Sequence[Any]]] = {**self.model.coords}
-        if coords:
-            untyped_coords.update(coords)
-        self.coords = {
-            cname: np.array(cvals) if isinstance(cvals, tuple) else cvals
-            for cname, cvals in untyped_coords.items()
-            if cvals is not None
-        }
-
-        self.dims = {} if dims is None else dims
-        model_dims = {k: list(v) for k, v in self.model.named_vars_to_dims.items()}
-        self.dims = {**model_dims, **self.dims}
+        user_coords = {} if coords is None else coords
+        user_dims = {} if dims is None else dims
+        model_coords, model_dims = coords_and_dims_for_inferencedata(self.model)
+        self.coords = {**model_coords, **user_coords}
+        self.dims = {**model_dims, **user_dims}
 
         if sample_dims is None:
             sample_dims = ["chain", "draw"]
@@ -398,13 +402,23 @@ class InferenceDataConverter:  # pylint: disable=too-many-instance-attributes
         if not constant_data:
             return None
 
-        return dict_to_dataset(
+        xarray_dataset = dict_to_dataset(
             constant_data,
             library=pymc,
             coords=self.coords,
             dims=self.dims,
             default_dims=[],
         )
+
+        # provisional handling of scalars in constant
+        # data to prevent promotion to rank 1
+        # in the future this will be handled by arviz
+        scalars = [var_name for var_name, value in constant_data.items() if np.ndim(value) == 0]
+        for s in scalars:
+            s_dim_0_name = f"{s}_dim_0"
+            xarray_dataset = xarray_dataset.squeeze(s_dim_0_name, drop=True)
+
+        return xarray_dataset
 
     def to_inference_data(self):
         """Convert all available data to an InferenceData object.

@@ -37,12 +37,15 @@
 import numpy as np
 import pytensor
 import pytensor.tensor as pt
+import pytest
 import scipy.stats as st
 
+from pymc import draw, logp
+from pymc.logprob.abstract import MeasurableVariable
+from pymc.logprob.basic import conditional_logp
 from pymc.logprob.censoring import MeasurableClip
 from pymc.logprob.rewriting import construct_ir_fgraph
 from pymc.testing import assert_no_rvs
-from tests.logprob.utils import joint_logprob
 
 
 def test_scalar_clipped_mixture():
@@ -61,9 +64,10 @@ def test_scalar_clipped_mixture():
     idxs_vv = idxs.clone()
     idxs_vv.name = "idxs_val"
 
-    logp = joint_logprob({idxs: idxs_vv, mix: mix_vv})
+    logp = conditional_logp({idxs: idxs_vv, mix: mix_vv})
+    logp_combined = pt.sum([pt.sum(factor) for factor in logp.values()])
 
-    logp_fn = pytensor.function([idxs_vv, mix_vv], logp)
+    logp_fn = pytensor.function([idxs_vv, mix_vv], logp_combined)
     assert logp_fn(0, 0.4) == -np.inf
     assert np.isclose(logp_fn(0, 0.5), st.norm.logcdf(0.5, 1) + np.log(0.6))
     assert np.isclose(logp_fn(0, 1.3), st.norm.logpdf(1.3, 1) + np.log(0.6))
@@ -98,8 +102,10 @@ def test_nested_scalar_mixtures():
     idxs12_vv = idxs12.clone()
     mix12_vv = mix12.clone()
 
-    logp = joint_logprob({idxs1: idxs1_vv, idxs2: idxs2_vv, idxs12: idxs12_vv, mix12: mix12_vv})
-    logp_fn = pytensor.function([idxs1_vv, idxs2_vv, idxs12_vv, mix12_vv], logp)
+    logp = conditional_logp({idxs1: idxs1_vv, idxs2: idxs2_vv, idxs12: idxs12_vv, mix12: mix12_vv})
+    logp_combined = pt.sum([pt.sum(factor) for factor in logp.values()])
+
+    logp_fn = pytensor.function([idxs1_vv, idxs2_vv, idxs12_vv, mix12_vv], logp_combined)
 
     expected_mu_logpdf = st.norm.logpdf(0) + np.log(0.5) * 3
     assert np.isclose(logp_fn(0, 0, 0, -50), expected_mu_logpdf)
@@ -115,10 +121,13 @@ def test_nested_scalar_mixtures():
     assert np.isclose(logp_fn(0, 0, 1, 50), st.norm.logpdf(150) + np.log(0.5) * 3)
 
 
-def test_unvalued_ir_reversion():
+@pytest.mark.parametrize("nested", (False, True))
+def test_unvalued_ir_reversion(nested):
     """Make sure that un-valued IR rewrites are reverted."""
     x_rv = pt.random.normal()
     y_rv = pt.clip(x_rv, 0, 1)
+    if nested:
+        y_rv = y_rv + 5
     z_rv = pt.random.normal(y_rv, 1, name="z")
     z_vv = z_rv.clone()
 
@@ -128,14 +137,10 @@ def test_unvalued_ir_reversion():
 
     z_fgraph, _, memo = construct_ir_fgraph(rv_values)
 
-    assert memo[y_rv] in z_fgraph.preserve_rv_mappings.measurable_conversions
-
-    measurable_y_rv = z_fgraph.preserve_rv_mappings.measurable_conversions[memo[y_rv]]
-    assert isinstance(measurable_y_rv.owner.op, MeasurableClip)
-
-    # `construct_ir_fgraph` should've reverted the un-valued measurable IR
-    # change
-    assert measurable_y_rv not in z_fgraph
+    # assert len(z_fgraph.preserve_rv_mappings.measurable_conversions) == 1
+    assert (
+        sum(isinstance(node.op, MeasurableVariable) for node in z_fgraph.apply_nodes) == 2
+    )  # Just the 2 rvs
 
 
 def test_shifted_cumsum():
@@ -144,9 +149,9 @@ def test_shifted_cumsum():
     y.name = "y"
 
     y_vv = y.clone()
-    logp = joint_logprob({y: y_vv})
+    logprob = logp(y, y_vv)
     assert np.isclose(
-        logp.eval({y_vv: np.arange(5) + 1 + 5}),
+        logprob.eval({y_vv: np.arange(5) + 1 + 5}).sum(),
         st.norm.logpdf(1) * 5,
     )
 
@@ -157,8 +162,8 @@ def test_double_log_transform_rv():
     y_rv.name = "y"
 
     y_vv = y_rv.clone()
-    logp = joint_logprob({y_rv: y_vv}, sum=False)
-    logp_fn = pytensor.function([y_vv], logp)
+    logprob = logp(y_rv, y_vv)
+    logp_fn = pytensor.function([y_vv], logprob)
 
     log_log_y_val = np.asarray(0.5)
     log_y_val = np.exp(log_log_y_val)
@@ -178,9 +183,9 @@ def test_affine_transform_rv():
     y_rv.name = "y"
     y_vv = y_rv.clone()
 
-    logp = joint_logprob({y_rv: y_vv}, sum=False)
-    assert_no_rvs(logp)
-    logp_fn = pytensor.function([loc, scale, y_vv], logp)
+    logprob = logp(y_rv, y_vv)
+    assert_no_rvs(logprob)
+    logp_fn = pytensor.function([loc, scale, y_vv], logprob)
 
     loc_test_val = 4.0
     scale_test_val = np.full(rv_size, 0.5)
@@ -200,8 +205,8 @@ def test_affine_log_transform_rv():
 
     y_vv = y_rv.clone()
 
-    logp = joint_logprob({y_rv: y_vv}, sum=False)
-    logp_fn = pytensor.function([a, b, y_vv], logp)
+    logprob = logp(y_rv, y_vv)
+    logp_fn = pytensor.function([a, b, y_vv], logprob)
 
     a_val = -1.5
     b_val = 3.0
@@ -210,4 +215,50 @@ def test_affine_log_transform_rv():
     assert np.allclose(
         logp_fn(a_val, b_val, y_val),
         st.norm(a_val, b_val).logpdf(y_val),
+    )
+
+
+@pytest.mark.parametrize("reverse", (False, True))
+def test_affine_join_interdependent(reverse):
+    x = pt.random.normal(name="x")
+    y_rvs = []
+    prev_rv = x
+    for i in range(3):
+        next_rv = pt.exp(prev_rv + pt.random.beta(3, 1, name=f"y{i}", size=(1, 2)))
+        y_rvs.append(next_rv)
+        prev_rv = next_rv
+
+    if reverse:
+        y_rvs = y_rvs[::-1]
+
+    ys = pt.concatenate(y_rvs, axis=0)
+    ys.name = "ys"
+
+    x_vv = x.clone()
+    ys_vv = ys.clone()
+
+    logp = conditional_logp({x: x_vv, ys: ys_vv})
+    logp_combined = pt.sum([pt.sum(factor) for factor in logp.values()])
+    assert_no_rvs(logp_combined)
+
+    y0_vv = y_rvs[0].clone()
+    y1_vv = y_rvs[1].clone()
+    y2_vv = y_rvs[2].clone()
+
+    ref_logp = conditional_logp({x: x_vv, y_rvs[0]: y0_vv, y_rvs[1]: y1_vv, y_rvs[2]: y2_vv})
+    ref_logp_combined = pt.sum([pt.sum(factor) for factor in ref_logp.values()])
+
+    rng = np.random.default_rng()
+    x_vv_test, ys_vv_test = draw([x, ys], random_seed=rng)
+    ys_vv_test = rng.normal(size=(3, 2))
+    np.testing.assert_allclose(
+        logp_combined.eval({x_vv: x_vv_test, ys_vv: ys_vv_test}),
+        ref_logp_combined.eval(
+            {
+                x_vv: x_vv_test,
+                y0_vv: ys_vv_test[0:1],
+                y1_vv: ys_vv_test[1:2],
+                y2_vv: ys_vv_test[2:3],
+            }
+        ),
     )

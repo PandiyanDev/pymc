@@ -40,10 +40,10 @@ from pymc.sampling.forward import (
     get_vars_in_point_list,
     observed_dependent_deterministics,
 )
-from pymc.testing import SeededTest, fast_unstable_sampling_mode
+from pymc.testing import fast_unstable_sampling_mode
 
 
-class TestDraw(SeededTest):
+class TestDraw:
     def test_univariate(self):
         with pm.Model():
             x = pm.Normal("x")
@@ -438,7 +438,7 @@ class TestCompileForwardSampler:
         }
 
 
-class TestSamplePPC(SeededTest):
+class TestSamplePPC:
     def test_normal_scalar(self):
         nchains = 2
         ndraws = 500
@@ -466,7 +466,7 @@ class TestSamplePPC(SeededTest):
             assert ppc["a"].shape == (nchains, ndraws)
 
             # test default case
-            random_state = self.get_random_state()
+            random_state = np.random.RandomState(20160911)
             idata_ppc = pm.sample_posterior_predictive(
                 trace, var_names=["a"], random_seed=random_state
             )
@@ -573,7 +573,7 @@ class TestSamplePPC(SeededTest):
             _, pval = stats.kstest(ppc["b"].flatten(), stats.norm(scale=scale).cdf)
             assert pval > 0.001
 
-    def test_model_not_drawable_prior(self):
+    def test_model_not_drawable_prior(self, seeded_test):
         data = np.random.poisson(lam=10, size=200)
         model = pm.Model()
         with model:
@@ -805,12 +805,12 @@ class TestSamplePPC(SeededTest):
 
         with m:
             pm.sample_prior_predictive(samples=1)
-        assert caplog.record_tuples == [("pymc", logging.INFO, "Sampling: [x, z]")]
+        assert caplog.record_tuples == [("pymc.sampling.forward", logging.INFO, "Sampling: [x, z]")]
         caplog.clear()
 
         with m:
             pm.sample_prior_predictive(samples=1, var_names=["x"])
-        assert caplog.record_tuples == [("pymc", logging.INFO, "Sampling: [x]")]
+        assert caplog.record_tuples == [("pymc.sampling.forward", logging.INFO, "Sampling: [x]")]
         caplog.clear()
 
     def test_logging_sampled_basic_rvs_posterior(self, caplog):
@@ -823,18 +823,20 @@ class TestSamplePPC(SeededTest):
         idata = az_from_dict(posterior={"x": np.zeros(5), "x_det": np.ones(5), "y": np.ones(5)})
         with m:
             pm.sample_posterior_predictive(idata)
-        assert caplog.record_tuples == [("pymc", logging.INFO, "Sampling: [z]")]
+        assert caplog.record_tuples == [("pymc.sampling.forward", logging.INFO, "Sampling: [z]")]
         caplog.clear()
 
         with m:
             pm.sample_posterior_predictive(idata, var_names=["y", "z"])
-        assert caplog.record_tuples == [("pymc", logging.INFO, "Sampling: [y, z]")]
+        assert caplog.record_tuples == [("pymc.sampling.forward", logging.INFO, "Sampling: [y, z]")]
         caplog.clear()
 
         # Resampling `x` will force resampling of `y`, even if it is in trace
         with m:
             pm.sample_posterior_predictive(idata, var_names=["x", "z"])
-        assert caplog.record_tuples == [("pymc", logging.INFO, "Sampling: [x, y, z]")]
+        assert caplog.record_tuples == [
+            ("pymc.sampling.forward", logging.INFO, "Sampling: [x, y, z]")
+        ]
         caplog.clear()
 
         # Missing deterministic `x_det` does not show in the log, even if it is being
@@ -842,21 +844,23 @@ class TestSamplePPC(SeededTest):
         idata = az_from_dict(posterior={"x": np.zeros(5)})
         with m:
             pm.sample_posterior_predictive(idata)
-        assert caplog.record_tuples == [("pymc", logging.INFO, "Sampling: [y, z]")]
+        assert caplog.record_tuples == [("pymc.sampling.forward", logging.INFO, "Sampling: [y, z]")]
         caplog.clear()
 
         # Missing deterministic `x_det` does not cause recomputation of downstream `y` RV
         idata = az_from_dict(posterior={"x": np.zeros(5), "y": np.ones(5)})
         with m:
             pm.sample_posterior_predictive(idata)
-        assert caplog.record_tuples == [("pymc", logging.INFO, "Sampling: [z]")]
+        assert caplog.record_tuples == [("pymc.sampling.forward", logging.INFO, "Sampling: [z]")]
         caplog.clear()
 
         # Missing `x` causes sampling of downstream `y` RV, even if it is present in trace
         idata = az_from_dict(posterior={"y": np.ones(5)})
         with m:
             pm.sample_posterior_predictive(idata)
-        assert caplog.record_tuples == [("pymc", logging.INFO, "Sampling: [x, y, z]")]
+        assert caplog.record_tuples == [
+            ("pymc.sampling.forward", logging.INFO, "Sampling: [x, y, z]")
+        ]
         caplog.clear()
 
     def test_logging_sampled_basic_rvs_posterior_deterministic(self, caplog):
@@ -871,7 +875,7 @@ class TestSamplePPC(SeededTest):
         idata = az_from_dict(posterior={"x": np.zeros(5), "x_det": np.ones(5), "y": np.ones(5)})
         with m:
             pm.sample_posterior_predictive(idata, var_names=["x_det", "z"])
-        assert caplog.record_tuples == [("pymc", logging.INFO, "Sampling: [y, z]")]
+        assert caplog.record_tuples == [("pymc.sampling.forward", logging.INFO, "Sampling: [y, z]")]
         caplog.clear()
 
     @staticmethod
@@ -938,19 +942,25 @@ class TestSamplePPC(SeededTest):
             # MultiTrace will only have the actual MCMC posterior samples but no information on
             # the MutableData and mutable coordinate values, so it will always assume they are volatile
             # and resample their descendants
-            assert caplog.record_tuples == [("pymc", logging.INFO, "Sampling: [a, b, sigma, y]")]
+            assert caplog.record_tuples == [
+                ("pymc.sampling.forward", logging.INFO, "Sampling: [a, b, sigma, y]")
+            ]
             caplog.clear()
         elif kind == "InferenceData":
             # InferenceData has all MCMC posterior samples and the values for both coordinates and
             # data containers. This enables it to see that no data has changed and it should only
             # resample the observed variable
-            assert caplog.record_tuples == [("pymc", logging.INFO, "Sampling: [y]")]
+            assert caplog.record_tuples == [
+                ("pymc.sampling.forward", logging.INFO, "Sampling: [y]")
+            ]
             caplog.clear()
         elif kind == "Dataset":
             # Dataset has all MCMC posterior samples and the values of the coordinates. This
             # enables it to see that the coordinates have not changed, but the MutableData is
             # assumed volatile by default
-            assert caplog.record_tuples == [("pymc", logging.INFO, "Sampling: [b, y]")]
+            assert caplog.record_tuples == [
+                ("pymc.sampling.forward", logging.INFO, "Sampling: [b, y]")
+            ]
             caplog.clear()
 
         original_offsets = model["offsets"].get_value()
@@ -959,13 +969,19 @@ class TestSamplePPC(SeededTest):
             pm.set_data({"offsets": original_offsets + 1})
             pm.sample_posterior_predictive(samples)
         if kind == "MultiTrace":
-            assert caplog.record_tuples == [("pymc", logging.INFO, "Sampling: [a, b, sigma, y]")]
+            assert caplog.record_tuples == [
+                ("pymc.sampling.forward", logging.INFO, "Sampling: [a, b, sigma, y]")
+            ]
             caplog.clear()
         elif kind == "InferenceData":
-            assert caplog.record_tuples == [("pymc", logging.INFO, "Sampling: [b, y]")]
+            assert caplog.record_tuples == [
+                ("pymc.sampling.forward", logging.INFO, "Sampling: [b, y]")
+            ]
             caplog.clear()
         elif kind == "Dataset":
-            assert caplog.record_tuples == [("pymc", logging.INFO, "Sampling: [b, y]")]
+            assert caplog.record_tuples == [
+                ("pymc.sampling.forward", logging.INFO, "Sampling: [b, y]")
+            ]
             caplog.clear()
 
         with model:
@@ -974,13 +990,19 @@ class TestSamplePPC(SeededTest):
             pm.set_data({"offsets": original_offsets, "y_obs": np.zeros((10, 4))})
             pm.sample_posterior_predictive(samples)
         if kind == "MultiTrace":
-            assert caplog.record_tuples == [("pymc", logging.INFO, "Sampling: [a, b, sigma, y]")]
+            assert caplog.record_tuples == [
+                ("pymc.sampling.forward", logging.INFO, "Sampling: [a, b, sigma, y]")
+            ]
             caplog.clear()
         elif kind == "InferenceData":
-            assert caplog.record_tuples == [("pymc", logging.INFO, "Sampling: [a, sigma, y]")]
+            assert caplog.record_tuples == [
+                ("pymc.sampling.forward", logging.INFO, "Sampling: [a, sigma, y]")
+            ]
             caplog.clear()
         elif kind == "Dataset":
-            assert caplog.record_tuples == [("pymc", logging.INFO, "Sampling: [a, b, sigma, y]")]
+            assert caplog.record_tuples == [
+                ("pymc.sampling.forward", logging.INFO, "Sampling: [a, b, sigma, y]")
+            ]
             caplog.clear()
 
         with model:
@@ -990,13 +1012,19 @@ class TestSamplePPC(SeededTest):
             pm.set_data({"offsets": original_offsets + 1, "y_obs": np.zeros((10, 3))})
             pm.sample_posterior_predictive(samples)
         if kind == "MultiTrace":
-            assert caplog.record_tuples == [("pymc", logging.INFO, "Sampling: [a, b, sigma, y]")]
+            assert caplog.record_tuples == [
+                ("pymc.sampling.forward", logging.INFO, "Sampling: [a, b, sigma, y]")
+            ]
             caplog.clear()
         elif kind == "InferenceData":
-            assert caplog.record_tuples == [("pymc", logging.INFO, "Sampling: [a, b, sigma, y]")]
+            assert caplog.record_tuples == [
+                ("pymc.sampling.forward", logging.INFO, "Sampling: [a, b, sigma, y]")
+            ]
             caplog.clear()
         elif kind == "Dataset":
-            assert caplog.record_tuples == [("pymc", logging.INFO, "Sampling: [a, b, sigma, y]")]
+            assert caplog.record_tuples == [
+                ("pymc.sampling.forward", logging.INFO, "Sampling: [a, b, sigma, y]")
+            ]
             caplog.clear()
 
 
@@ -1011,8 +1039,8 @@ def point_list_arg_bug_fixture() -> Tuple[pm.Model, pm.backends.base.MultiTrace]
     return pmodel, trace
 
 
-class TestSamplePriorPredictive(SeededTest):
-    def test_ignores_observed(self):
+class TestSamplePriorPredictive:
+    def test_ignores_observed(self, seeded_test):
         observed = np.random.normal(10, 1, size=200)
         with pm.Model():
             # Use a prior that's way off to show we're ignoring the observed variables
@@ -1053,7 +1081,7 @@ class TestSamplePriorPredictive(SeededTest):
 
         assert trace.prior["m"].shape == (1, 10, 4)
 
-    def test_multivariate2(self):
+    def test_multivariate2(self, seeded_test):
         # Added test for issue #3271
         mn_data = np.random.multinomial(n=100, pvals=[1 / 6.0] * 6, size=10)
         with pm.Model() as dm_model:
@@ -1086,7 +1114,7 @@ class TestSamplePriorPredictive(SeededTest):
         avg = np.stack([b_sampler() for i in range(10000)]).mean(0)
         npt.assert_array_almost_equal(avg, 0.5 * np.ones((10,)), decimal=2)
 
-    def test_transformed(self):
+    def test_transformed(self, seeded_test):
         n = 18
         at_bats = 45 * np.ones(n, dtype=int)
         hits = np.random.randint(1, 40, size=n, dtype=int)
@@ -1107,7 +1135,7 @@ class TestSamplePriorPredictive(SeededTest):
         assert gen.prior_predictive["y"].shape == (1, draws, n)
         assert "thetas" in gen.prior.data_vars
 
-    def test_shared(self):
+    def test_shared(self, seeded_test):
         n1 = 10
         obs = shared(np.random.rand(n1) < 0.5)
         draws = 50
@@ -1129,7 +1157,7 @@ class TestSamplePriorPredictive(SeededTest):
         assert gen2.prior_predictive["y"].shape == (1, draws, n2)
         assert gen2.prior["o"].shape == (1, draws, n2)
 
-    def test_density_dist(self):
+    def test_density_dist(self, seeded_test):
         obs = np.random.normal(-1, 0.1, size=10)
         with pm.Model():
             mu = pm.Normal("mu", 0, 1)
@@ -1316,7 +1344,7 @@ def test_distinct_rvs():
     assert np.array_equal(pp_samples["y"], pp_samples_2["y"])
 
 
-class TestNestedRandom(SeededTest):
+class TestNestedRandom:
     def build_model(self, distribution, shape, nested_rvs_info):
         with pm.Model() as model:
             nested_rvs = {}
@@ -1606,11 +1634,13 @@ def test_get_vars_in_point_list():
     with pm.Model() as modelA:
         pm.Normal("a", 0, 1)
         pm.Normal("b", 0, 1)
+        pm.Normal("d", 0, 1)
     with pm.Model() as modelB:
         a = pm.Normal("a", 0, 1)
         pm.Normal("c", 0, 1)
+        pm.ConstantData("d", 0)
 
-    point_list = [{"a": 0, "b": 0}]
+    point_list = [{"a": 0, "b": 0, "d": 0}]
     vars_in_trace = get_vars_in_point_list(point_list, modelB)
     assert set(vars_in_trace) == {a}
 

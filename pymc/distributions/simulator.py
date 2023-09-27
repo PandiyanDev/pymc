@@ -20,7 +20,7 @@ import pytensor.tensor as pt
 
 from pytensor.graph.op import Apply, Op
 from pytensor.tensor.random.op import RandomVariable
-from pytensor.tensor.var import TensorVariable
+from pytensor.tensor.variable import TensorVariable
 from scipy.spatial import cKDTree
 
 from pymc.distributions.distribution import Distribution, _moment
@@ -29,7 +29,7 @@ from pymc.pytensorf import floatX
 
 __all__ = ["Simulator"]
 
-_log = logging.getLogger("pymc")
+_log = logging.getLogger(__name__)
 
 
 class SimulatorRV(RandomVariable):

@@ -80,7 +80,7 @@ __all__ = (
 ArrayLike: TypeAlias = Union[np.ndarray, List[float]]
 PointList: TypeAlias = List[PointType]
 
-_log = logging.getLogger("pymc")
+_log = logging.getLogger(__name__)
 
 
 def get_vars_in_point_list(trace, model):
@@ -89,7 +89,8 @@ def get_vars_in_point_list(trace, model):
         names_in_trace = list(trace[0])
     else:
         names_in_trace = trace.varnames
-    vars_in_trace = [model[v] for v in names_in_trace if v in model]
+    traceable_varnames = {var.name for var in (model.free_RVs + model.deterministics)}
+    vars_in_trace = [model[v] for v in names_in_trace if v in traceable_varnames]
     return vars_in_trace
 
 

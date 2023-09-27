@@ -246,7 +246,7 @@ class CompoundStep:
                 method.reset_tuning()
 
     @property
-    def vars(self):
+    def vars(self) -> List[Variable]:
         return [var for method in self.methods for var in method.vars]
 
 
@@ -260,6 +260,16 @@ def flatten_steps(step: Union[BlockedStep, CompoundStep]) -> List[BlockedStep]:
     for sm in step.methods:
         steps += flatten_steps(sm)
     return steps
+
+
+def check_step_emits_tune(step: Union[CompoundStep, BlockedStep]):
+    if isinstance(step, BlockedStep) and "tune" not in step.stats_dtypes_shapes:
+        raise TypeError(f"{type(step)} does not emit the required 'tune' stat.")
+    elif isinstance(step, CompoundStep):
+        for sstep in step.methods:
+            if "tune" not in sstep.stats_dtypes_shapes:
+                raise TypeError(f"{type(sstep)} does not emit the required 'tune' stat.")
+    return
 
 
 class StatsBijection:

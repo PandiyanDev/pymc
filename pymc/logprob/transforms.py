@@ -42,6 +42,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pytensor.tensor as pt
 
+from pytensor import scan
 from pytensor.gradient import DisconnectedType, jacobian
 from pytensor.graph.basic import Apply, Node, Variable
 from pytensor.graph.features import AlreadyThere, Feature
@@ -49,34 +50,71 @@ from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.op import Op
 from pytensor.graph.replace import clone_replace
 from pytensor.graph.rewriting.basic import GraphRewriter, in2out, node_rewriter
-from pytensor.scalar import Abs, Add, Exp, Log, Mul, Pow, Sqr, Sqrt
+from pytensor.scalar import (
+    Abs,
+    Add,
+    ArcCosh,
+    ArcSinh,
+    ArcTanh,
+    Cosh,
+    Erf,
+    Erfc,
+    Erfcx,
+    Exp,
+    Exp2,
+    Expm1,
+    Log,
+    Log1mexp,
+    Log1p,
+    Log2,
+    Log10,
+    Mul,
+    Pow,
+    Sigmoid,
+    Sinh,
+    Softplus,
+    Sqr,
+    Sqrt,
+    Tanh,
+)
 from pytensor.scan.op import Scan
 from pytensor.tensor.exceptions import NotScalarConstantError
 from pytensor.tensor.math import (
     abs,
     add,
+    arccosh,
+    arcsinh,
+    arctanh,
+    cosh,
+    erf,
+    erfc,
+    erfcx,
     exp,
+    exp2,
+    expm1,
     log,
+    log1mexp,
+    log1p,
+    log2,
+    log10,
     mul,
     neg,
     pow,
     reciprocal,
+    sigmoid,
+    sinh,
+    softplus,
     sqr,
     sqrt,
     sub,
+    tanh,
     true_div,
 )
-from pytensor.tensor.rewriting.basic import (
-    register_specialize,
-    register_stabilize,
-    register_useless,
-)
-from pytensor.tensor.var import TensorVariable
+from pytensor.tensor.variable import TensorVariable
 
 from pymc.logprob.abstract import (
     MeasurableElemwise,
     MeasurableVariable,
-    _get_measurable_outputs,
     _icdf,
     _icdf_helper,
     _logcdf,
@@ -84,8 +122,12 @@ from pymc.logprob.abstract import (
     _logprob,
     _logprob_helper,
 )
-from pymc.logprob.rewriting import PreserveRVMappings, measurable_ir_rewrites_db
-from pymc.logprob.utils import check_potential_measurability, ignore_logprob
+from pymc.logprob.rewriting import (
+    PreserveRVMappings,
+    cleanup_ir_rewrites_db,
+    measurable_ir_rewrites_db,
+)
+from pymc.logprob.utils import check_potential_measurability
 
 
 class TransformedVariable(Op):
@@ -112,16 +154,23 @@ class TransformedVariable(Op):
 transformed_variable = TransformedVariable()
 
 
-@register_specialize
-@register_stabilize
-@register_useless
 @node_rewriter([TransformedVariable])
 def remove_TransformedVariables(fgraph, node):
     if isinstance(node.op, TransformedVariable):
         return [node.inputs[0]]
 
 
+cleanup_ir_rewrites_db.register(
+    "remove_TransformedVariables",
+    remove_TransformedVariables,
+    "cleanup",
+    "transform",
+)
+
+
 class RVTransform(abc.ABC):
+    ndim_supp = None
+
     @abc.abstractmethod
     def forward(self, value: TensorVariable, *inputs: Variable) -> TensorVariable:
         """Apply the transformation."""
@@ -135,12 +184,19 @@ class RVTransform(abc.ABC):
 
     def log_jac_det(self, value: TensorVariable, *inputs) -> TensorVariable:
         """Construct the log of the absolute value of the Jacobian determinant."""
-        # jac = pt.reshape(
-        #     gradient(pt.sum(self.backward(value, *inputs)), [value]), value.shape
-        # )
-        # return pt.log(pt.abs(jac))
-        phi_inv = self.backward(value, *inputs)
-        return pt.log(pt.abs(pt.nlinalg.det(pt.atleast_2d(jacobian(phi_inv, [value])[0]))))
+        if self.ndim_supp not in (0, 1):
+            raise NotImplementedError(
+                f"RVTransform default log_jac_det only implemented for ndim_supp in (0, 1), got {self.ndim_supp=}"
+            )
+        if self.ndim_supp == 0:
+            jac = pt.reshape(pt.grad(pt.sum(self.backward(value, *inputs)), [value]), value.shape)
+            return pt.log(pt.abs(jac))
+        else:
+            phi_inv = self.backward(value, *inputs)
+            return pt.log(pt.abs(pt.nlinalg.det(pt.atleast_2d(jacobian(phi_inv, [value])[0]))))
+
+    def __str__(self):
+        return f"{self.__class__.__name__}"
 
 
 @node_rewriter(tracks=None)
@@ -192,7 +248,6 @@ def transform_values(fgraph: FunctionGraph, node: Node) -> Optional[List[Node]]:
     # with "inversely/un-" transformed versions of itself.
     for rv_var, value_var, transform in zip(rv_vars, value_vars, transforms):
         rv_var_out_idx = node.outputs.index(rv_var)
-        trans_node.outputs[rv_var_out_idx].name = rv_var.name
 
         if transform is None:
             continue
@@ -256,7 +311,6 @@ def transform_scan_values(fgraph: FunctionGraph, node: Node) -> Optional[List[No
     # with "inversely/un-" transformed versions of itself.
     for rv_var, value_var, transform in zip(rv_vars, value_vars, transforms):
         rv_var_out_idx = node.outputs.index(rv_var)
-        trans_node.outputs[rv_var_out_idx].name = rv_var.name
 
         if transform is None:
             continue
@@ -340,7 +394,23 @@ class TransformValuesRewrite(GraphRewriter):
 class MeasurableTransform(MeasurableElemwise):
     """A placeholder used to specify a log-likelihood for a transformed measurable variable"""
 
-    valid_scalar_types = (Exp, Log, Add, Mul, Pow, Abs)
+    valid_scalar_types = (
+        Exp,
+        Log,
+        Add,
+        Mul,
+        Pow,
+        Abs,
+        Sinh,
+        Cosh,
+        Tanh,
+        ArcSinh,
+        ArcCosh,
+        ArcTanh,
+        Erf,
+        Erfc,
+        Erfcx,
+    )
 
     # Cannot use `transform` as name because it would clash with the property added by
     # the `TransformValuesRewrite`
@@ -351,11 +421,6 @@ class MeasurableTransform(MeasurableElemwise):
         self.transform_elemwise = transform
         self.measurable_input_idx = measurable_input_idx
         super().__init__(*args, **kwargs)
-
-
-@_get_measurable_outputs.register(MeasurableTransform)
-def _get_measurable_outputs_Transform(op, node):
-    return [node.default_output()]
 
 
 @_logprob.register(MeasurableTransform)
@@ -394,6 +459,10 @@ def measurable_transform_logprob(op: MeasurableTransform, values, *inputs, **kwa
     return pt.switch(pt.isnan(jacobian), -np.inf, input_logprob + jacobian)
 
 
+MONOTONICALLY_INCREASING_OPS = (Exp, Log, Add, Sinh, Tanh, ArcSinh, ArcCosh, ArcTanh, Erf)
+MONOTONICALLY_DECREASING_OPS = (Erfc, Erfcx)
+
+
 @_logcdf.register(MeasurableTransform)
 def measurable_transform_logcdf(op: MeasurableTransform, value, *inputs, **kwargs):
     """Compute the log-CDF graph for a `MeasurabeTransform`."""
@@ -402,16 +471,40 @@ def measurable_transform_logcdf(op: MeasurableTransform, value, *inputs, **kwarg
 
     backward_value = op.transform_elemwise.backward(value, *other_inputs)
 
-    # Some transformations, like squaring may produce multiple backward values
+    # Fail if transformation is not injective
+    # A TensorVariable is returned in 1-to-1 inversions, and a tuple in 1-to-many
     if isinstance(backward_value, tuple):
         raise NotImplementedError
 
-    input_logcdf = _logcdf_helper(measurable_input, backward_value)
+    logcdf = _logcdf_helper(measurable_input, backward_value)
+    logccdf = pt.log1mexp(logcdf)
+
+    if isinstance(op.scalar_op, MONOTONICALLY_INCREASING_OPS):
+        pass
+    elif isinstance(op.scalar_op, MONOTONICALLY_DECREASING_OPS):
+        logcdf = logccdf
+    # mul is monotonically increasing for scale > 0, and monotonically decreasing otherwise
+    elif isinstance(op.scalar_op, Mul):
+        [scale] = other_inputs
+        logcdf = pt.switch(pt.ge(scale, 0), logcdf, logccdf)
+    # pow is increasing if pow > 0, and decreasing otherwise (even powers are rejected above)!
+    # Care must be taken to handle negative values (https://math.stackexchange.com/a/442362/783483)
+    elif isinstance(op.scalar_op, Pow):
+        if op.transform_elemwise.power < 0:
+            logcdf_zero = _logcdf_helper(measurable_input, 0)
+            logcdf = pt.switch(
+                pt.lt(backward_value, 0),
+                pt.log(pt.exp(logcdf_zero) - pt.exp(logcdf)),
+                pt.logaddexp(logccdf, logcdf_zero),
+            )
+    else:
+        # We don't know if this Op is monotonically increasing/decreasing
+        raise NotImplementedError
 
     # The jacobian is used to ensure a value in the supported domain was provided
     jacobian = op.transform_elemwise.log_jac_det(value, *other_inputs)
 
-    return pt.switch(pt.isnan(jacobian), -np.inf, input_logcdf)
+    return pt.switch(pt.isnan(jacobian), -np.inf, logcdf)
 
 
 @_icdf.register(MeasurableTransform)
@@ -420,8 +513,26 @@ def measurable_transform_icdf(op: MeasurableTransform, value, *inputs, **kwargs)
     other_inputs = list(inputs)
     measurable_input = other_inputs.pop(op.measurable_input_idx)
 
+    if isinstance(op.scalar_op, MONOTONICALLY_INCREASING_OPS):
+        pass
+    elif isinstance(op.scalar_op, MONOTONICALLY_DECREASING_OPS):
+        value = 1 - value
+    elif isinstance(op.scalar_op, Mul):
+        [scale] = other_inputs
+        value = pt.switch(pt.lt(scale, 0), 1 - value, value)
+    elif isinstance(op.scalar_op, Pow):
+        if op.transform_elemwise.power < 0:
+            raise NotImplementedError
+    else:
+        raise NotImplementedError
+
     input_icdf = _icdf_helper(measurable_input, value)
     icdf = op.transform_elemwise.forward(input_icdf, *other_inputs)
+
+    # Fail if transformation is not injective
+    # A TensorVariable is returned in 1-to-1 inversions, and a tuple in 1-to-many
+    if isinstance(op.transform_elemwise.backward(icdf, *other_inputs), tuple):
+        raise NotImplementedError
 
     return icdf
 
@@ -429,36 +540,14 @@ def measurable_transform_icdf(op: MeasurableTransform, value, *inputs, **kwargs)
 @node_rewriter([reciprocal])
 def measurable_reciprocal_to_power(fgraph, node):
     """Convert reciprocal of `MeasurableVariable`s to power."""
-    inp = node.inputs[0]
-    if not (inp.owner and isinstance(inp.owner.op, MeasurableVariable)):
-        return None
-
-    rv_map_feature: Optional[PreserveRVMappings] = getattr(fgraph, "preserve_rv_mappings", None)
-    if rv_map_feature is None:
-        return None  # pragma: no cover
-
-    # Only apply this rewrite if the variable is unvalued
-    if inp in rv_map_feature.rv_values:
-        return None  # pragma: no cover
-
+    [inp] = node.inputs
     return [pt.pow(inp, -1.0)]
 
 
 @node_rewriter([sqr, sqrt])
 def measurable_sqrt_sqr_to_power(fgraph, node):
     """Convert square root or square of `MeasurableVariable`s to power form."""
-
-    inp = node.inputs[0]
-    if not (inp.owner and isinstance(inp.owner.op, MeasurableVariable)):
-        return None
-
-    rv_map_feature: Optional[PreserveRVMappings] = getattr(fgraph, "preserve_rv_mappings", None)
-    if rv_map_feature is None:
-        return None  # pragma: no cover
-
-    # Only apply this rewrite if the variable is unvalued
-    if inp in rv_map_feature.rv_values:
-        return None  # pragma: no cover
+    [inp] = node.inputs
 
     if isinstance(node.op.scalar_op, Sqr):
         return [pt.pow(inp, 2)]
@@ -470,21 +559,6 @@ def measurable_sqrt_sqr_to_power(fgraph, node):
 @node_rewriter([true_div])
 def measurable_div_to_product(fgraph, node):
     """Convert divisions involving `MeasurableVariable`s to products."""
-
-    measurable_vars = [
-        var for var in node.inputs if (var.owner and isinstance(var.owner.op, MeasurableVariable))
-    ]
-    if not measurable_vars:
-        return None  # pragma: no cover
-
-    rv_map_feature: Optional[PreserveRVMappings] = getattr(fgraph, "preserve_rv_mappings", None)
-    if rv_map_feature is None:
-        return None  # pragma: no cover
-
-    # Only apply this rewrite if there is one unvalued MeasurableVariable involved
-    if all(measurable_var in rv_map_feature.rv_values for measurable_var in measurable_vars):
-        return None  # pragma: no cover
-
     numerator, denominator = node.inputs
 
     # Check if numerator is 1
@@ -503,44 +577,65 @@ def measurable_div_to_product(fgraph, node):
 @node_rewriter([neg])
 def measurable_neg_to_product(fgraph, node):
     """Convert negation of `MeasurableVariable`s to product with `-1`."""
-
     inp = node.inputs[0]
-    if not (inp.owner and isinstance(inp.owner.op, MeasurableVariable)):
-        return None
-
-    rv_map_feature: Optional[PreserveRVMappings] = getattr(fgraph, "preserve_rv_mappings", None)
-    if rv_map_feature is None:
-        return None  # pragma: no cover
-
-    # Only apply this rewrite if the variable is unvalued
-    if inp in rv_map_feature.rv_values:
-        return None  # pragma: no cover
-
     return [pt.mul(inp, -1.0)]
 
 
 @node_rewriter([sub])
 def measurable_sub_to_neg(fgraph, node):
     """Convert subtraction involving `MeasurableVariable`s to addition with neg"""
-    measurable_vars = [
-        var for var in node.inputs if (var.owner and isinstance(var.owner.op, MeasurableVariable))
-    ]
-    if not measurable_vars:
-        return None  # pragma: no cover
-
-    rv_map_feature: Optional[PreserveRVMappings] = getattr(fgraph, "preserve_rv_mappings", None)
-    if rv_map_feature is None:
-        return None  # pragma: no cover
-
-    # Only apply this rewrite if there is one unvalued MeasurableVariable involved
-    if all(measurable_var in rv_map_feature.rv_values for measurable_var in measurable_vars):
-        return None  # pragma: no cover
-
     minuend, subtrahend = node.inputs
     return [pt.add(minuend, pt.neg(subtrahend))]
 
 
-@node_rewriter([exp, log, add, mul, pow, abs])
+@node_rewriter([log1p, softplus, log1mexp, log2, log10])
+def measurable_special_log_to_log(fgraph, node):
+    """Convert log1p, log1mexp, softplus, log2, log10 of `MeasurableVariable`s to log form."""
+    [inp] = node.inputs
+
+    if isinstance(node.op.scalar_op, Log1p):
+        return [pt.log(1 + inp)]
+    if isinstance(node.op.scalar_op, Softplus):
+        return [pt.log(1 + pt.exp(inp))]
+    if isinstance(node.op.scalar_op, Log1mexp):
+        return [pt.log(1 - pt.exp(inp))]
+    if isinstance(node.op.scalar_op, Log2):
+        return [pt.log(inp) / pt.log(2)]
+    if isinstance(node.op.scalar_op, Log10):
+        return [pt.log(inp) / pt.log(10)]
+
+
+@node_rewriter([expm1, sigmoid, exp2])
+def measurable_special_exp_to_exp(fgraph, node):
+    """Convert expm1, sigmoid, and exp2 of `MeasurableVariable`s to xp form."""
+    [inp] = node.inputs
+    if isinstance(node.op.scalar_op, Exp2):
+        return [pt.exp(pt.log(2) * inp)]
+    if isinstance(node.op.scalar_op, Expm1):
+        return [pt.add(pt.exp(inp), -1)]
+    if isinstance(node.op.scalar_op, Sigmoid):
+        return [1 / (1 + pt.exp(-inp))]
+
+
+@node_rewriter(
+    [
+        exp,
+        log,
+        add,
+        mul,
+        pow,
+        abs,
+        sinh,
+        cosh,
+        tanh,
+        arcsinh,
+        arccosh,
+        arctanh,
+        erf,
+        erfc,
+        erfcx,
+    ]
+)
 def find_measurable_transforms(fgraph: FunctionGraph, node: Node) -> Optional[List[Node]]:
     """Find measurable transformations from Elemwise operators."""
 
@@ -553,18 +648,12 @@ def find_measurable_transforms(fgraph: FunctionGraph, node: Node) -> Optional[Li
         return None  # pragma: no cover
 
     # Check that we have a single source of measurement
-    measurable_inputs = [
-        inp
-        for idx, inp in enumerate(node.inputs)
-        if inp.owner
-        and isinstance(inp.owner.op, MeasurableVariable)
-        and inp not in rv_map_feature.rv_values
-    ]
+    measurable_inputs = rv_map_feature.request_measurable(node.inputs)
 
     if len(measurable_inputs) != 1:
         return None
 
-    measurable_input: TensorVariable = measurable_inputs[0]
+    [measurable_input] = measurable_inputs
 
     # Do not apply rewrite to discrete variables
     if measurable_input.type.dtype.startswith("int"):
@@ -574,24 +663,30 @@ def find_measurable_transforms(fgraph: FunctionGraph, node: Node) -> Optional[Li
     # would be invalid
     other_inputs = tuple(inp for inp in node.inputs if inp is not measurable_input)
 
-    if not check_potential_measurability(other_inputs, rv_map_feature):
+    if check_potential_measurability(other_inputs, rv_map_feature.rv_values.keys()):
         return None
-
-    # Make base_measure outputs unmeasurable
-    # This seems to be the only thing preventing nested rewrites from being erased
-    measurable_input = ignore_logprob(measurable_input)
 
     scalar_op = node.op.scalar_op
     measurable_input_idx = 0
     transform_inputs: Tuple[TensorVariable, ...] = (measurable_input,)
     transform: RVTransform
-    if isinstance(scalar_op, Exp):
-        transform = ExpTransform()
-    elif isinstance(scalar_op, Log):
-        transform = LogTransform()
-    elif isinstance(scalar_op, Abs):
-        transform = AbsTransform()
-    elif isinstance(scalar_op, Pow):
+
+    transform_dict = {
+        Exp: ExpTransform(),
+        Log: LogTransform(),
+        Abs: AbsTransform(),
+        Sinh: SinhTransform(),
+        Cosh: CoshTransform(),
+        Tanh: TanhTransform(),
+        ArcSinh: ArcsinhTransform(),
+        ArcCosh: ArccoshTransform(),
+        ArcTanh: ArctanhTransform(),
+        Erf: ErfTransform(),
+        Erfc: ErfcTransform(),
+        Erfcx: ErfcxTransform(),
+    }
+    transform = transform_dict.get(type(scalar_op), None)
+    if isinstance(scalar_op, Pow):
         # We only allow for the base to be measurable
         if measurable_input_idx != 0:
             return None
@@ -608,20 +703,17 @@ def find_measurable_transforms(fgraph: FunctionGraph, node: Node) -> Optional[Li
         transform = LocTransform(
             transform_args_fn=lambda *inputs: inputs[-1],
         )
-    else:
+    elif transform is None:
         transform_inputs = (measurable_input, pt.mul(*other_inputs))
         transform = ScaleTransform(
             transform_args_fn=lambda *inputs: inputs[-1],
         )
-
     transform_op = MeasurableTransform(
         scalar_op=scalar_op,
         transform=transform,
         measurable_input_idx=measurable_input_idx,
     )
     transform_out = transform_op.make_node(*transform_inputs).default_output()
-    transform_out.name = node.outputs[0].name
-
     return [transform_out]
 
 
@@ -664,11 +756,148 @@ measurable_ir_rewrites_db.register(
 )
 
 measurable_ir_rewrites_db.register(
+    "measurable_special_log_to_log",
+    measurable_special_log_to_log,
+    "basic",
+    "transform",
+)
+
+measurable_ir_rewrites_db.register(
+    "measurable_special_exp_to_exp",
+    measurable_special_exp_to_exp,
+    "basic",
+    "transform",
+)
+
+
+measurable_ir_rewrites_db.register(
     "find_measurable_transforms",
     find_measurable_transforms,
     "basic",
     "transform",
 )
+
+
+class SinhTransform(RVTransform):
+    name = "sinh"
+    ndim_supp = 0
+
+    def forward(self, value, *inputs):
+        return pt.sinh(value)
+
+    def backward(self, value, *inputs):
+        return pt.arcsinh(value)
+
+
+class CoshTransform(RVTransform):
+    name = "cosh"
+    ndim_supp = 0
+
+    def forward(self, value, *inputs):
+        return pt.cosh(value)
+
+    def backward(self, value, *inputs):
+        back_value = pt.arccosh(value)
+        return (-back_value, back_value)
+
+    def log_jac_det(self, value, *inputs):
+        return pt.switch(
+            value < 1,
+            np.nan,
+            -pt.log(pt.sqrt(value**2 - 1)),
+        )
+
+
+class TanhTransform(RVTransform):
+    name = "tanh"
+    ndim_supp = 0
+
+    def forward(self, value, *inputs):
+        return pt.tanh(value)
+
+    def backward(self, value, *inputs):
+        return pt.arctanh(value)
+
+
+class ArcsinhTransform(RVTransform):
+    name = "arcsinh"
+    ndim_supp = 0
+
+    def forward(self, value, *inputs):
+        return pt.arcsinh(value)
+
+    def backward(self, value, *inputs):
+        return pt.sinh(value)
+
+
+class ArccoshTransform(RVTransform):
+    name = "arccosh"
+    ndim_supp = 0
+
+    def forward(self, value, *inputs):
+        return pt.arccosh(value)
+
+    def backward(self, value, *inputs):
+        return pt.cosh(value)
+
+
+class ArctanhTransform(RVTransform):
+    name = "arctanh"
+    ndim_supp = 0
+
+    def forward(self, value, *inputs):
+        return pt.arctanh(value)
+
+    def backward(self, value, *inputs):
+        return pt.tanh(value)
+
+
+class ErfTransform(RVTransform):
+    name = "erf"
+    ndim_supp = 0
+
+    def forward(self, value, *inputs):
+        return pt.erf(value)
+
+    def backward(self, value, *inputs):
+        return pt.erfinv(value)
+
+
+class ErfcTransform(RVTransform):
+    name = "erfc"
+    ndim_supp = 0
+
+    def forward(self, value, *inputs):
+        return pt.erfc(value)
+
+    def backward(self, value, *inputs):
+        return pt.erfcinv(value)
+
+
+class ErfcxTransform(RVTransform):
+    name = "erfcx"
+    ndim_supp = 0
+
+    def forward(self, value, *inputs):
+        return pt.erfcx(value)
+
+    def backward(self, value, *inputs):
+        # computes the inverse of erfcx, this was adapted from
+        # https://tinyurl.com/4mxfd3cz
+        x = pt.switch(value <= 1, 1.0 / (value * pt.sqrt(np.pi)), -pt.sqrt(pt.log(value)))
+
+        def calc_delta_x(value, prior_result):
+            return prior_result - (pt.erfcx(prior_result) - value) / (
+                2 * prior_result * pt.erfcx(prior_result) - 2 / pt.sqrt(np.pi)
+            )
+
+        result, updates = scan(
+            fn=calc_delta_x,
+            outputs_info=pt.ones_like(x),
+            non_sequences=value,
+            n_steps=10,
+        )
+        return result[-1]
 
 
 class LocTransform(RVTransform):
@@ -760,7 +989,7 @@ class PowerTransform(RVTransform):
         super().__init__()
 
     def forward(self, value, *inputs):
-        pt.power(value, self.power)
+        return pt.power(value, self.power)
 
     def backward(self, value, *inputs):
         inv_power = 1 / self.power
@@ -861,8 +1090,10 @@ class SimplexTransform(RVTransform):
     name = "simplex"
 
     def forward(self, value, *inputs):
+        value = pt.as_tensor(value)
         log_value = pt.log(value)
-        shift = pt.sum(log_value, -1, keepdims=True) / value.shape[-1]
+        N = value.shape[-1].astype(value.dtype)
+        shift = pt.sum(log_value, -1, keepdims=True) / N
         return log_value[..., :-1] - shift
 
     def backward(self, value, *inputs):
@@ -871,7 +1102,9 @@ class SimplexTransform(RVTransform):
         return exp_value_max / pt.sum(exp_value_max, -1, keepdims=True)
 
     def log_jac_det(self, value, *inputs):
+        value = pt.as_tensor(value)
         N = value.shape[-1] + 1
+        N = N.astype(value.dtype)
         sum_value = pt.sum(value, -1, keepdims=True)
         value_sum_expanded = value + sum_value
         value_sum_expanded = pt.concatenate([value_sum_expanded, pt.zeros(sum_value.shape)], -1)
@@ -989,22 +1222,46 @@ def _create_transformed_rv_op(
         if not isinstance(logprobs, Sequence):
             logprobs = [logprobs]
 
-        if use_jacobian:
-            assert len(values) == len(logprobs) == len(op.transforms)
-            logprobs_jac = []
-            for value, transform, logp in zip(values, op.transforms, logprobs):
-                if transform is None:
-                    logprobs_jac.append(logp)
-                    continue
-                assert isinstance(value.owner.op, TransformedVariable)
-                original_forward_value = value.owner.inputs[1]
-                jacobian = transform.log_jac_det(original_forward_value, *inputs).copy()
-                if value.name:
-                    jacobian.name = f"{value.name}_jacobian"
-                logprobs_jac.append(logp + jacobian)
-            logprobs = logprobs_jac
+        # Handle jacobian
+        assert len(values) == len(logprobs) == len(op.transforms)
+        logprobs_jac = []
+        for value, transform, logp in zip(values, op.transforms, logprobs):
+            if transform is None:
+                logprobs_jac.append(logp)
+                continue
 
-        return logprobs
+            assert isinstance(value.owner.op, TransformedVariable)
+            original_forward_value = value.owner.inputs[1]
+            log_jac_det = transform.log_jac_det(original_forward_value, *inputs).copy()
+            # The jacobian determinant has less dims than the logp
+            # when a multivariate transform (like Simplex or Ordered) is applied to univariate distributions.
+            # In this case we have to reduce the last logp dimensions, as they are no longer independent
+            if log_jac_det.ndim < logp.ndim:
+                diff_ndims = logp.ndim - log_jac_det.ndim
+                logp = logp.sum(axis=np.arange(-diff_ndims, 0))
+            # This case is sometimes, but not always, trivial to accomodate depending on the "space rank" of the
+            # multivariate distribution. See https://proceedings.mlr.press/v130/radul21a.html
+            elif log_jac_det.ndim > logp.ndim:
+                raise NotImplementedError(
+                    f"Univariate transform {transform} cannot be applied to multivariate {rv_op}"
+                )
+            else:
+                # Check there is no broadcasting between logp and jacobian
+                if logp.type.broadcastable != log_jac_det.type.broadcastable:
+                    raise ValueError(
+                        f"The logp of {rv_op} and log_jac_det of {transform} are not allowed to broadcast together. "
+                        "There is a bug in the implementation of either one."
+                    )
+
+            if use_jacobian:
+                if value.name:
+                    log_jac_det.name = f"{value.name}_jacobian"
+                logprobs_jac.append(logp + log_jac_det)
+            else:
+                # We still want to use the reduced logp, even though the jacobian isn't included
+                logprobs_jac.append(logp)
+
+        return logprobs_jac
 
     new_op = copy(rv_op)
     new_op.__class__ = new_op_type

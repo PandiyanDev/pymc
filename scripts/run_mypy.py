@@ -33,12 +33,16 @@ pymc/logprob/binary.py
 pymc/logprob/censoring.py
 pymc/logprob/basic.py
 pymc/logprob/mixture.py
+pymc/logprob/order.py
 pymc/logprob/rewriting.py
 pymc/logprob/scan.py
 pymc/logprob/tensor.py
 pymc/logprob/transforms.py
 pymc/logprob/utils.py
-pymc/model.py
+pymc/model/core.py
+pymc/model/fgraph.py
+pymc/model/transform/basic.py
+pymc/model/transform/conditioning.py
 pymc/model_graph.py
 pymc/printing.py
 pymc/pytensorf.py

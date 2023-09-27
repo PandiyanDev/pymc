@@ -16,7 +16,7 @@
 
 import logging
 
-_log = logging.getLogger("pymc")
+_log = logging.getLogger(__name__)
 
 if not logging.root.handlers:
     _log.setLevel(logging.INFO)
@@ -63,7 +63,8 @@ from pymc.math import (
     logsumexp,
     probit,
 )
-from pymc.model import *
+from pymc.model.core import *
+from pymc.model.transform.conditioning import do, observe
 from pymc.model_graph import model_to_graphviz, model_to_networkx
 from pymc.plots import *
 from pymc.printing import *

@@ -35,7 +35,7 @@ import scipy.sparse as sps
 from pytensor import scalar
 from pytensor.compile import Function, Mode, get_mode
 from pytensor.gradient import grad
-from pytensor.graph import node_rewriter, rewrite_graph
+from pytensor.graph import Type, node_rewriter, rewrite_graph
 from pytensor.graph.basic import (
     Apply,
     Constant,
@@ -47,6 +47,7 @@ from pytensor.graph.basic import (
 from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.op import Op
 from pytensor.scalar.basic import Cast
+from pytensor.scan.op import Scan
 from pytensor.tensor.basic import _as_tensor_variable
 from pytensor.tensor.elemwise import Elemwise
 from pytensor.tensor.random.op import RandomVariable
@@ -59,11 +60,12 @@ from pytensor.tensor.rewriting.basic import topo_constant_folding
 from pytensor.tensor.rewriting.shape import ShapeFeature
 from pytensor.tensor.sharedvar import SharedVariable, TensorSharedVariable
 from pytensor.tensor.subtensor import AdvancedIncSubtensor, AdvancedIncSubtensor1
-from pytensor.tensor.var import TensorConstant, TensorVariable
+from pytensor.tensor.variable import TensorConstant, TensorVariable
 
 from pymc.exceptions import NotConstantValueError
 from pymc.logprob.transforms import RVTransform
 from pymc.logprob.utils import CheckParameterValue
+from pymc.util import makeiter
 from pymc.vartypes import continuous_types, isgenerator, typefilter
 
 PotentialShapeType = Union[int, np.ndarray, Sequence[Union[int, Variable]], TensorVariable]
@@ -85,7 +87,6 @@ __all__ = [
     "generator",
     "convert_observed_data",
     "compile_pymc",
-    "constant_fold",
 ]
 
 
@@ -205,12 +206,12 @@ def walk_model(
     yield from walk(graphs, expand, bfs=False)
 
 
-def _replace_rvs_in_graphs(
+def _replace_vars_in_graphs(
     graphs: Iterable[TensorVariable],
     replacement_fn: Callable[[TensorVariable], Dict[TensorVariable, TensorVariable]],
     **kwargs,
 ) -> Tuple[List[TensorVariable], Dict[TensorVariable, TensorVariable]]:
-    """Replace random variables in graphs
+    """Replace variables in graphs.
 
     This will *not* recompute test values.
 
@@ -218,6 +219,9 @@ def _replace_rvs_in_graphs(
     ----------
     graphs
         The graphs in which random variables are to be replaced.
+    replacement_fn
+        A callable called on each graph output that populates a replacement dictionary and returns
+        nodes that should be investigated further.
 
     Returns
     -------
@@ -256,7 +260,8 @@ def _replace_rvs_in_graphs(
         toposort = fg.toposort()
         sorted_replacements = sorted(
             tuple(replacements.items()),
-            key=lambda pair: toposort.index(pair[0].owner),
+            # Root inputs don't have owner, we give them negative priority -1
+            key=lambda pair: toposort.index(pair[0].owner) if pair[0].owner is not None else -1,
             reverse=True,
         )
         fg.replace_all(sorted_replacements, import_missing=True)
@@ -317,7 +322,7 @@ def rvs_to_value_vars(
     equiv = clone_get_equiv(inputs, graphs, False, False, {})
     graphs = [equiv[n] for n in graphs]
 
-    graphs, _ = _replace_rvs_in_graphs(
+    graphs, _ = _replace_vars_in_graphs(
         graphs,
         replacement_fn=populate_replacements,
         **kwargs,
@@ -385,7 +390,7 @@ def replace_rvs_by_values(
         # replacements if that is not a simple input variable
         return [value]
 
-    graphs, _ = _replace_rvs_in_graphs(
+    graphs, _ = _replace_vars_in_graphs(
         graphs,
         replacement_fn=poulate_replacements,
         **kwargs,
@@ -543,13 +548,6 @@ def hessian_diag(f, vars=None):
         return -pt.concatenate([hessian_diag1(f, v) for v in vars], axis=0)
     else:
         return empty_gradient
-
-
-def makeiter(a):
-    if isinstance(a, (tuple, list)):
-        return a
-    else:
-        return [a]
 
 
 class IdentityOp(scalar.UnaryScalarOp):
@@ -1000,16 +998,49 @@ def reseed_rngs(
 
 
 def collect_default_updates(
-    inputs: Sequence[Variable],
     outputs: Sequence[Variable],
+    *,
+    inputs: Optional[Sequence[Variable]] = None,
     must_be_shared: bool = True,
 ) -> Dict[Variable, Variable]:
     """Collect default update expression for shared-variable RNGs used by RVs between inputs and outputs.
 
-    If `must_be_shared` is False, update expressions will also be returned for non-shared input RNGs.
-    This can be useful to obtain the symbolic update expressions from inner graphs.
-    """
+    Parameters
+    ----------
+    outputs: list of PyTensor variables
+        List of variables in which graphs default updates will be collected.
+    inputs: list of PyTensor variables, optional
+        Input nodes above which default updates should not be collected.
+        When not provided, search will include top level inputs (roots).
+    must_be_shared: bool, default True
+        Used internally by PyMC. Whether updates should be collected for non-shared
+        RNG input variables. This is used to collect update expressions for inner graphs.
 
+    Examples
+    --------
+    .. code:: python
+        import pymc as pm
+        from pytensor.scan import scan
+        from pymc.pytensorf import collect_default_updates
+
+        def scan_step(xtm1):
+            x = xtm1 + pm.Normal.dist()
+            x_update = collect_default_updates([x])
+            return x, x_update
+
+        x0 = pm.Normal.dist()
+
+        xs, updates = scan(
+            fn=scan_step,
+            outputs_info=[x0],
+            n_steps=10,
+        )
+
+        # PyMC makes use of the updates to seed xs properly.
+        # Without updates, it would raise an error.
+        xs_draws = pm.draw(xs, draws=10)
+
+    """
     # Avoid circular import
     from pymc.distributions.distribution import SymbolicRandomVariable
 
@@ -1044,15 +1075,30 @@ def collect_default_updates(
             next_rng = client.op.update(client).get(rng)
             if next_rng is None:
                 raise ValueError(
-                    f"No update mapping found for RNG used in SymbolicRandomVariable Op {client.op}"
+                    f"No update found for at least one RNG used in SymbolicRandomVariable Op {client.op}"
+                )
+        elif isinstance(client.op, Scan):
+            # Check if any shared output corresponds to the RNG
+            rng_idx = client.inputs.index(rng)
+            io_map = client.op.get_oinp_iinp_iout_oout_mappings()["outer_out_from_outer_inp"]
+            out_idx = io_map.get(rng_idx, -1)
+            if out_idx != -1:
+                next_rng = client.outputs[out_idx]
+            else:  # No break
+                raise ValueError(
+                    f"No update found for at least one RNG used in Scan Op {client.op}.\n"
+                    "You can use `pytensorf.collect_default_updates` inside the Scan function to return updates automatically."
                 )
         else:
-            # We don't know how this RNG should be updated (e.g., Scan).
+            # We don't know how this RNG should be updated (e.g., OpFromGraph).
             # The user should provide an update manually
             return None
 
         # Recurse until we find final update for RNG
         return find_default_update(clients, next_rng)
+
+    if inputs is None:
+        inputs = []
 
     outputs = makeiter(outputs)
     fg = FunctionGraph(outputs=outputs, clone=False)
@@ -1125,7 +1171,7 @@ def compile_pymc(
     """
     # Create an update mapping of RandomVariable's RNG so that it is automatically
     # updated after every function call
-    rng_updates = collect_default_updates(inputs, outputs)
+    rng_updates = collect_default_updates(inputs=inputs, outputs=outputs)
 
     # We always reseed random variables as this provides RNGs with no chances of collision
     if rng_updates:
@@ -1181,3 +1227,53 @@ def constant_fold(
     return tuple(
         folded_x.data if isinstance(folded_x, Constant) else folded_x for folded_x in folded_xs
     )
+
+
+def rewrite_pregrad(graph):
+    """Apply simplifying or stabilizing rewrites to graph that are safe to use
+    pre-grad.
+    """
+    return rewrite_graph(graph, include=("canonicalize", "stabilize"))
+
+
+class StringType(Type[str]):
+    def clone(self, **kwargs):
+        return type(self)()
+
+    def filter(self, x, strict=False, allow_downcast=None):
+        if isinstance(x, str):
+            return x
+        else:
+            raise TypeError("Expected a string!")
+
+    def __str__(self):
+        return "string"
+
+    @staticmethod
+    def may_share_memory(a, b):
+        return isinstance(a, str) and a is b
+
+
+stringtype = StringType()
+
+
+class StringConstant(Constant):
+    pass
+
+
+@pytensor._as_symbolic.register(str)
+def as_symbolic_string(x, **kwargs):
+    return StringConstant(stringtype, x)
+
+
+def toposort_replace(
+    fgraph: FunctionGraph, replacements: Sequence[Tuple[Variable, Variable]], reverse: bool = False
+) -> None:
+    """Replace multiple variables in topological order."""
+    toposort = fgraph.toposort()
+    sorted_replacements = sorted(
+        replacements,
+        key=lambda pair: toposort.index(pair[0].owner) if pair[0].owner else -1,
+        reverse=reverse,
+    )
+    fgraph.replace_all(sorted_replacements, import_missing=True)

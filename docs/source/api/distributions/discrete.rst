@@ -5,12 +5,12 @@ Discrete
 .. currentmodule:: pymc
 .. autosummary::
    :toctree: generated
+   :template: distribution.rst
 
    Bernoulli
    BetaBinomial
    Binomial
    Categorical
-   DiracDelta
    DiscreteUniform
    DiscreteWeibull
    Geometric
@@ -19,6 +19,3 @@ Discrete
    OrderedLogistic
    OrderedProbit
    Poisson
-   ZeroInflatedBinomial
-   ZeroInflatedNegativeBinomial
-   ZeroInflatedPoisson

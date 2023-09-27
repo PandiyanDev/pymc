@@ -23,7 +23,8 @@ from pytensor.graph.basic import ancestors, walk
 from pytensor.scalar.basic import Cast
 from pytensor.tensor.elemwise import Elemwise
 from pytensor.tensor.random.op import RandomVariable
-from pytensor.tensor.var import TensorConstant, TensorVariable
+from pytensor.tensor.shape import Shape
+from pytensor.tensor.variable import TensorConstant, TensorVariable
 
 import pymc as pm
 
@@ -55,6 +56,9 @@ class ModelGraph:
 
         def _filter_non_parameter_inputs(var):
             node = var.owner
+            if isinstance(node.op, Shape):
+                # Don't show shape-related dependencies
+                return []
             if isinstance(node.op, RandomVariable):
                 # Filter out rng, dtype and size parameters or RandomVariable nodes
                 return node.inputs[3:]

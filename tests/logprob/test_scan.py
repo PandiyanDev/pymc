@@ -45,14 +45,13 @@ from pytensor.scan.utils import ScanArgs
 from scipy import stats
 
 from pymc.logprob.abstract import _logprob_helper
-from pymc.logprob.basic import factorized_joint_logprob, logp
+from pymc.logprob.basic import conditional_logp, logp
 from pymc.logprob.scan import (
     construct_scan,
     convert_outer_out_to_in,
     get_random_outer_outputs,
 )
 from pymc.testing import assert_no_rvs
-from tests.logprob.utils import joint_logprob
 
 
 def create_inner_out_logp(value_map):
@@ -336,7 +335,8 @@ def test_scan_joint_logprob(require_inner_rewrites):
     s_vv = S_rv.clone()
     s_vv.name = "s"
 
-    y_logp = joint_logprob({Y_rv: y_vv, S_rv: s_vv, Gamma_rv: Gamma_vv})
+    y_logp = conditional_logp({Y_rv: y_vv, S_rv: s_vv, Gamma_rv: Gamma_vv})
+    y_logp_combined = pt.sum([pt.sum(factor) for factor in y_logp.values()])
 
     y_val = np.arange(10)
     s_val = np.array([0, 1, 0, 1, 1, 0, 0, 0, 1, 1])
@@ -350,7 +350,7 @@ def test_scan_joint_logprob(require_inner_rewrites):
         Gamma_vv: Gamma_val,
     }
 
-    y_logp_fn = pytensor.function(list(test_point.keys()), y_logp)
+    y_logp_fn = pytensor.function(list(test_point.keys()), y_logp_combined)
 
     assert_no_rvs(y_logp_fn.maker.fgraph.outputs[0])
 
@@ -381,7 +381,7 @@ def test_scan_joint_logprob(require_inner_rewrites):
 
     assert_no_rvs(y_logp_ref)
 
-    y_logp_val = y_logp.eval(test_point)
+    y_logp_val = y_logp_combined.eval(test_point)
 
     y_logp_ref_val = y_logp_ref.eval(test_point)
 
@@ -421,7 +421,7 @@ def test_initial_values():
     s_1T_vv = S_1T_rv.clone()
     s_1T_vv.name = "s_1T"
 
-    logp_parts = factorized_joint_logprob({S_1T_rv: s_1T_vv, S_0_rv: s_0_vv})
+    logp_parts = conditional_logp({S_1T_rv: s_1T_vv, S_0_rv: s_0_vv})
 
     s_0_val = 0
     s_1T_val = np.array([1, 0, 1, 0, 1, 1, 0, 1, 0, 1])
@@ -451,7 +451,7 @@ def test_mode_is_kept(remove_asserts):
     )
     x.name = "x"
     x_vv = x.clone()
-    x_logp = pytensor.function([x_vv], joint_logprob({x: x_vv}))
+    x_logp = pytensor.function([x_vv], pt.sum(logp(x, x_vv)))
 
     x_test_val = np.full((10,), -1)
     if remove_asserts:
@@ -492,7 +492,7 @@ def test_scan_over_seqs():
 
     xs_vv = ys.clone()
     ys_vv = ys.clone()
-    ys_logp = factorized_joint_logprob({xs: xs_vv, ys: ys_vv})[ys_vv]
+    ys_logp = conditional_logp({xs: xs_vv, ys: ys_vv})[ys_vv]
 
     assert_no_rvs(ys_logp)
 

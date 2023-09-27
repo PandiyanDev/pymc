@@ -24,13 +24,15 @@ import pytensor.tensor as pt
 import pytest
 import scipy.sparse as sps
 
+from pytensor import scan, shared
 from pytensor.compile.builders import OpFromGraph
 from pytensor.graph.basic import Variable, equal_computations
 from pytensor.tensor.random.basic import normal, uniform
 from pytensor.tensor.random.op import RandomVariable
 from pytensor.tensor.random.var import RandomStateSharedVariable
+from pytensor.tensor.slinalg import Cholesky
 from pytensor.tensor.subtensor import AdvancedIncSubtensor, AdvancedIncSubtensor1
-from pytensor.tensor.var import TensorVariable
+from pytensor.tensor.variable import TensorVariable
 
 import pymc as pm
 
@@ -40,6 +42,7 @@ from pymc.distributions.transforms import Interval
 from pymc.exceptions import NotConstantValueError
 from pymc.logprob.utils import ParameterValueError
 from pymc.pytensorf import (
+    _replace_vars_in_graphs,
     collect_default_updates,
     compile_pymc,
     constant_fold,
@@ -463,7 +466,7 @@ class TestCompilePyMC:
             ],
         )(rng1, rng2)
         with pytest.raises(
-            ValueError, match="No update mapping found for RNG used in SymbolicRandomVariable"
+            ValueError, match="No update found for at least one RNG used in SymbolicRandomVariable"
         ):
             compile_pymc(inputs=[], outputs=[dummy_x1, dummy_x2])
 
@@ -529,7 +532,7 @@ class TestCompilePyMC:
         next_rng2, y = pt.random.normal(rng=next_rng1).owner.outputs
         next_rng3, z = pt.random.normal(rng=next_rng2).owner.outputs
 
-        collect_default_updates([], [x, y, z]) == {rng: next_rng3}
+        collect_default_updates(inputs=[], outputs=[x, y, z]) == {rng: next_rng3}
 
         fn = compile_pymc([], [x, y, z], random_seed=514)
         assert not set(list(np.array(fn()))) & set(list(np.array(fn())))
@@ -538,19 +541,56 @@ class TestCompilePyMC:
         fn = pytensor.function([], [x, y, z], updates={rng: next_rng1})
         assert set(list(np.array(fn()))) & set(list(np.array(fn())))
 
+    def test_collect_default_updates_must_be_shared(self):
+        shared_rng = pytensor.shared(np.random.default_rng())
+        nonshared_rng = shared_rng.type()
 
-def test_collect_default_updates_must_be_shared():
-    shared_rng = pytensor.shared(np.random.default_rng())
-    nonshared_rng = shared_rng.type()
+        next_rng_of_shared, x = pt.random.normal(rng=shared_rng).owner.outputs
+        next_rng_of_nonshared, y = pt.random.normal(rng=nonshared_rng).owner.outputs
 
-    next_rng_of_shared, x = pt.random.normal(rng=shared_rng).owner.outputs
-    next_rng_of_nonshared, y = pt.random.normal(rng=nonshared_rng).owner.outputs
+        res = collect_default_updates(inputs=[nonshared_rng], outputs=[x, y])
+        assert res == {shared_rng: next_rng_of_shared}
 
-    res = collect_default_updates(inputs=[nonshared_rng], outputs=[x, y])
-    assert res == {shared_rng: next_rng_of_shared}
+        res = collect_default_updates(inputs=[nonshared_rng], outputs=[x, y], must_be_shared=False)
+        assert res == {shared_rng: next_rng_of_shared, nonshared_rng: next_rng_of_nonshared}
 
-    res = collect_default_updates(inputs=[nonshared_rng], outputs=[x, y], must_be_shared=False)
-    assert res == {shared_rng: next_rng_of_shared, nonshared_rng: next_rng_of_nonshared}
+    def test_scan_updates(self):
+        def step_with_update(x, rng):
+            next_rng, x = pm.Normal.dist(x, rng=rng).owner.outputs
+            return x, {rng: next_rng}
+
+        def step_wo_update(x, rng):
+            return step_with_update(x, rng)[0]
+
+        rng = pytensor.shared(np.random.default_rng())
+
+        xs, next_rng = scan(
+            fn=step_wo_update,
+            outputs_info=[pt.zeros(())],
+            non_sequences=[rng],
+            n_steps=10,
+            name="test_scan",
+        )
+
+        assert not next_rng
+
+        with pytest.raises(
+            ValueError,
+            match="No update found for at least one RNG used in Scan Op",
+        ):
+            collect_default_updates([xs])
+
+        ys, next_rng = scan(
+            fn=step_with_update,
+            outputs_info=[pt.zeros(())],
+            non_sequences=[rng],
+            n_steps=10,
+        )
+
+        assert collect_default_updates([ys]) == {rng: tuple(next_rng.values())[0]}
+
+        fn = compile_pymc([], ys, random_seed=1)
+        assert not (set(fn()) & set(fn()))
 
 
 def test_replace_rng_nodes():
@@ -821,3 +861,52 @@ class TestReplaceRVsByValues:
             ),
             [expected_x, expected_y, expected_z, expected_w],
         )
+
+    def test_replace_input(self):
+        inp = shared(0.0, name="inp")
+        x = pm.Normal.dist(inp)
+
+        assert x.eval() < 50
+
+        new_inp = inp + 100
+
+        def replacement_fn(var, replacements):
+            if var is x:
+                replacements[x.owner.inputs[3]] = new_inp
+
+            return []
+
+        [new_x], _ = _replace_vars_in_graphs([x], replacement_fn=replacement_fn)
+
+        assert new_x.eval() > 50
+
+
+def test_mvnormal_no_cholesky_op():
+    """
+    Test MvNormal likelihood when using Cholesky factor parameterization does not unnecessarily
+    recompute the cholesky factorization
+    Reversion test of #6717
+    """
+    with pm.Model() as m:
+        n = 3
+        sd_dist = pm.HalfNormal.dist(shape=n)
+        chol, corr, sigmas = pm.LKJCholeskyCov("cov", n=n, eta=1, sd_dist=sd_dist)
+        mu = np.zeros(n)
+        data = np.ones((10, n))
+        pm.MvNormal("y", mu=mu, chol=chol, observed=data)
+
+    contains_cholesky_op = lambda fgraph: any(
+        isinstance(node.op, Cholesky) for node in fgraph.apply_nodes
+    )
+
+    logp = m.compile_logp()
+    assert not contains_cholesky_op(logp.f.maker.fgraph)
+
+    dlogp = m.compile_dlogp()
+    assert not contains_cholesky_op(dlogp.f.maker.fgraph)
+
+    d2logp = m.compile_d2logp()
+    assert not contains_cholesky_op(d2logp.f.maker.fgraph)
+
+    logp_dlogp = m.logp_dlogp_function()
+    assert not contains_cholesky_op(logp_dlogp._pytensor_function.maker.fgraph)
