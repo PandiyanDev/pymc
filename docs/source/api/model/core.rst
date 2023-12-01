@@ -1,6 +1,3 @@
-Model
------
-
 Model creation and inspection
 -----------------------------
 
@@ -9,13 +6,12 @@ Model creation and inspection
    :toctree: generated/
 
    Model
-   model_to_graphviz
-   model_to_networkx
    modelcontext
 
 Others
 ------
 
+.. currentmodule:: pymc.model.core
 .. autosummary::
    :toctree: generated/
 
@@ -24,3 +20,14 @@ Others
    set_data
    Point
    compile_fn
+
+
+Graph visualization
+-------------------
+
+.. currentmodule:: pymc.model_graph
+.. autosummary::
+   :toctree: generated/
+
+   model_to_networkx
+   model_to_graphviz

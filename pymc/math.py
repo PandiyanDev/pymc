@@ -32,12 +32,21 @@ from pytensor.graph.op import Op
 from pytensor.tensor import (
     abs,
     and_,
+    arccos,
+    arccosh,
+    arcsin,
+    arcsinh,
+    arctan,
+    arctanh,
+    broadcast_to,
     ceil,
     clip,
     concatenate,
     constant,
     cos,
     cosh,
+    cumprod,
+    cumsum,
     dot,
     eq,
     erf,
@@ -47,6 +56,8 @@ from pytensor.tensor import (
     exp,
     flatten,
     floor,
+    full,
+    full_like,
     ge,
     gt,
     le,
@@ -55,9 +66,14 @@ from pytensor.tensor import (
     logaddexp,
     logsumexp,
     lt,
+    matmul,
+    max,
     maximum,
+    mean,
+    min,
     minimum,
     neq,
+    ones,
     ones_like,
     or_,
     prod,
@@ -73,6 +89,7 @@ from pytensor.tensor import (
     tan,
     tanh,
     where,
+    zeros,
     zeros_like,
 )
 from pytensor.tensor.linalg import solve_triangular
@@ -87,12 +104,21 @@ from pymc.pytensorf import floatX, ix_, largest_common_dtype
 __all__ = [
     "abs",
     "and_",
+    "arccos",
+    "arccosh",
+    "arcsin",
+    "arcsinh",
+    "arctan",
+    "arctanh",
+    "broadcast_to",
     "ceil",
     "clip",
     "concatenate",
     "constant",
     "cos",
     "cosh",
+    "cumprod",
+    "cumsum",
     "dot",
     "eq",
     "erf",
@@ -100,6 +126,8 @@ __all__ = [
     "erfcinv",
     "erfinv",
     "exp",
+    "full",
+    "full_like",
     "flatten",
     "floor",
     "ge",
@@ -110,12 +138,18 @@ __all__ = [
     "logaddexp",
     "logsumexp",
     "lt",
+    "matmul",
+    "max",
     "maximum",
+    "mean",
+    "min",
     "minimum",
     "neq",
+    "ones",
     "ones_like",
     "or_",
     "prod",
+    "round",
     "sgn",
     "sigmoid",
     "sin",
@@ -128,6 +162,7 @@ __all__ = [
     "tan",
     "tanh",
     "where",
+    "zeros",
     "zeros_like",
     "kronecker",
     "cartesian",
@@ -244,13 +279,18 @@ def kron_diag(*diags):
     return reduce(flat_outer, diags)
 
 
-def tround(*args, **kwargs):
+def round(*args, **kwargs):
     """
     Temporary function to silence round warning in PyTensor. Please remove
     when the warning disappears.
     """
     kwargs["mode"] = "half_to_even"
     return pt.round(*args, **kwargs)
+
+
+def tround(*args, **kwargs):
+    warnings.warn("tround is deprecated. Use round instead.")
+    return round(*args, **kwargs)
 
 
 def logdiffexp(a, b):

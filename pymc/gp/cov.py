@@ -48,6 +48,8 @@ __all__ = [
     "Kron",
 ]
 
+from pymc.pytensorf import constant_fold
+
 TensorLike = Union[np.ndarray, TensorVariable]
 IntSequence = Union[np.ndarray, Sequence[int]]
 
@@ -183,9 +185,6 @@ class Covariance(BaseCovariance):
     def _slice(self, X, Xs=None):
         xdims = X.shape[-1]
         if isinstance(xdims, Variable):
-            # Circular dependency
-            from pymc.pytensorf import constant_fold
-
             [xdims] = constant_fold([xdims])
         if self.input_dim != xdims:
             warnings.warn(
@@ -779,8 +778,8 @@ class Periodic(Stationary):
         X, Xs = self._slice(X, Xs)
         if Xs is None:
             Xs = X
-        f1 = pt.expand_dims(X, axis=(0,))
-        f2 = pt.expand_dims(Xs, axis=(1,))
+        f1 = pt.expand_dims(X, axis=(1,))
+        f2 = pt.expand_dims(Xs, axis=(0,))
         r = np.pi * (f1 - f2) / self.period
         r2 = pt.sum(pt.square(pt.sin(r) / self.ls), 2)
         return self.full_from_distance(r2, squared=True)
@@ -946,8 +945,8 @@ class WrappedPeriodic(Covariance):
         X, Xs = self._slice(X, Xs)
         if Xs is None:
             Xs = X
-        f1 = pt.expand_dims(X, axis=(0,))
-        f2 = pt.expand_dims(Xs, axis=(1,))
+        f1 = pt.expand_dims(X, axis=(1,))
+        f2 = pt.expand_dims(Xs, axis=(0,))
         r = np.pi * (f1 - f2) / self.period
         r2 = pt.sum(pt.square(pt.sin(r) / self.cov_func.ls), 2)
         return self.cov_func.full_from_distance(r2, squared=True)

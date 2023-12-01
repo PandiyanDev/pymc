@@ -36,10 +36,9 @@ from pytensor.tensor.extra_ops import broadcast_shape
 from pytensor.tensor.math import tanh
 from pytensor.tensor.random.basic import (
     BetaRV,
+    _gamma,
     cauchy,
-    chisquare,
     exponential,
-    gamma,
     gumbel,
     halfcauchy,
     halfnormal,
@@ -49,6 +48,7 @@ from pytensor.tensor.random.basic import (
     lognormal,
     normal,
     pareto,
+    t,
     triangular,
     uniform,
     vonmises,
@@ -56,7 +56,7 @@ from pytensor.tensor.random.basic import (
 from pytensor.tensor.random.op import RandomVariable
 from pytensor.tensor.variable import TensorConstant
 
-from pymc.logprob.abstract import _logcdf_helper, _logprob_helper
+from pymc.logprob.abstract import _logprob_helper
 from pymc.logprob.basic import icdf
 
 try:
@@ -568,11 +568,13 @@ class TruncatedNormalRV(RandomVariable):
         upper: Union[np.ndarray, float],
         size: Optional[Union[List[int], int]],
     ) -> np.ndarray:
+        # Upcast to float64. (Caller will downcast to desired dtype if needed)
+        #   (Work-around for https://github.com/scipy/scipy/issues/15928)
         return stats.truncnorm.rvs(
-            a=(lower - mu) / sigma,
-            b=(upper - mu) / sigma,
-            loc=mu,
-            scale=sigma,
+            a=((lower - mu) / sigma).astype("float64"),
+            b=((upper - mu) / sigma).astype("float64"),
+            loc=(mu).astype("float64"),
+            scale=(sigma).astype("float64"),
             size=size,
             random_state=rng,
         )
@@ -664,7 +666,7 @@ class TruncatedNormal(BoundedContinuous):
     @classmethod
     def dist(
         cls,
-        mu: Optional[DIST_PARAMETER_TYPES] = None,
+        mu: Optional[DIST_PARAMETER_TYPES] = 0,
         sigma: Optional[DIST_PARAMETER_TYPES] = None,
         *,
         tau: Optional[DIST_PARAMETER_TYPES] = None,
@@ -674,7 +676,6 @@ class TruncatedNormal(BoundedContinuous):
     ) -> RandomVariable:
         tau, sigma = get_tau_sigma(tau=tau, sigma=sigma)
         sigma = pt.as_tensor_variable(sigma)
-        tau = pt.as_tensor_variable(tau)
         mu = pt.as_tensor_variable(floatX(mu))
 
         lower = pt.as_tensor_variable(floatX(lower)) if lower is not None else pt.constant(-np.inf)
@@ -1735,21 +1736,6 @@ class LogNormal(PositiveContinuous):
 Lognormal = LogNormal
 
 
-class StudentTRV(RandomVariable):
-    name = "studentt"
-    ndim_supp = 0
-    ndims_params = [0, 0, 0]
-    dtype = "floatX"
-    _print_name = ("StudentT", "\\operatorname{StudentT}")
-
-    @classmethod
-    def rng_fn(cls, rng, nu, mu, sigma, size=None) -> np.ndarray:
-        return np.asarray(stats.t.rvs(nu, mu, sigma, size=size, random_state=rng))
-
-
-studentt = StudentTRV()
-
-
 class StudentT(Continuous):
     r"""
     Student's T log-likelihood.
@@ -1814,7 +1800,7 @@ class StudentT(Continuous):
         with pm.Model():
             x = pm.StudentT('x', nu=15, mu=0, lam=1/23)
     """
-    rv_op = studentt
+    rv_op = t
 
     @classmethod
     def dist(cls, nu, mu=0, *, sigma=None, lam=None, **kwargs):
@@ -2201,16 +2187,17 @@ class Gamma(PositiveContinuous):
     sigma : tensor_like of float, optional
         Alternative scale parameter (sigma > 0).
     """
-    rv_op = gamma
+    # gamma is temporarily a deprecation wrapper in PyTensor
+    rv_op = _gamma
 
     @classmethod
     def dist(cls, alpha=None, beta=None, mu=None, sigma=None, **kwargs):
         alpha, beta = cls.get_alpha_beta(alpha, beta, mu, sigma)
         alpha = pt.as_tensor_variable(floatX(alpha))
         beta = pt.as_tensor_variable(floatX(beta))
-
-        # The PyTensor `GammaRV` `Op` will invert the `beta` parameter itself
-        return super().dist([alpha, beta], **kwargs)
+        # PyTensor gamma op is parametrized in terms of scale (1/beta)
+        scale = pt.reciprocal(beta)
+        return super().dist([alpha, scale], **kwargs)
 
     @classmethod
     def get_alpha_beta(cls, alpha=None, beta=None, mu=None, sigma=None):
@@ -2232,15 +2219,14 @@ class Gamma(PositiveContinuous):
 
         return alpha, beta
 
-    def moment(rv, size, alpha, inv_beta):
-        # The PyTensor `GammaRV` `Op` inverts the `beta` parameter itself
-        mean = alpha * inv_beta
+    def moment(rv, size, alpha, scale):
+        mean = alpha * scale
         if not rv_size_is_none(size):
             mean = pt.full(size, mean)
         return mean
 
-    def logp(value, alpha, inv_beta):
-        beta = pt.reciprocal(inv_beta)
+    def logp(value, alpha, scale):
+        beta = pt.reciprocal(scale)
         res = -pt.gammaln(alpha) + logpow(beta, alpha) - beta * value + logpow(value, alpha - 1)
         res = pt.switch(pt.ge(value, 0.0), res, -np.inf)
         return check_parameters(
@@ -2250,14 +2236,13 @@ class Gamma(PositiveContinuous):
             msg="alpha > 0, beta > 0",
         )
 
-    def logcdf(value, alpha, inv_beta):
-        beta = pt.reciprocal(inv_beta)
+    def logcdf(value, alpha, scale):
+        beta = pt.reciprocal(scale)
         res = pt.switch(
             pt.lt(value, 0),
             -np.inf,
             pt.log(pt.gammainc(alpha, beta * value)),
         )
-
         return check_parameters(res, 0 < alpha, 0 < beta, msg="alpha > 0, beta > 0")
 
 
@@ -2376,15 +2361,20 @@ class InverseGamma(PositiveContinuous):
         )
 
 
-class ChiSquared(PositiveContinuous):
+class ChiSquared:
     r"""
     :math:`\chi^2` log-likelihood.
+
+    This is the distribution from the sum of the squares of :math:`\nu` independent standard normal random variables or a special
+    case of the gamma distribution with :math:`\alpha = \nu/2` and :math:`\beta = 1/2`.
 
     The pdf of this distribution is
 
     .. math::
 
        f(x \mid \nu) = \frac{x^{(\nu-2)/2}e^{-x/2}}{2^{\nu/2}\Gamma(\nu/2)}
+
+    Read more about the :math:`\chi^2` distribution at https://en.wikipedia.org/wiki/Chi-squared_distribution
 
     .. plot::
         :context: close-figs
@@ -2415,24 +2405,13 @@ class ChiSquared(PositiveContinuous):
     nu : tensor_like of float
         Degrees of freedom (nu > 0).
     """
-    rv_op = chisquare
+
+    def __new__(cls, name, nu, **kwargs):
+        return Gamma(name, alpha=nu / 2, beta=1 / 2, **kwargs)
 
     @classmethod
-    def dist(cls, nu, *args, **kwargs):
-        nu = pt.as_tensor_variable(floatX(nu))
-        return super().dist([nu], *args, **kwargs)
-
-    def moment(rv, size, nu):
-        moment = nu
-        if not rv_size_is_none(size):
-            moment = pt.full(size, moment)
-        return moment
-
-    def logp(value, nu):
-        return _logprob_helper(Gamma.dist(alpha=nu / 2, beta=0.5), value)
-
-    def logcdf(value, nu):
-        return _logcdf_helper(Gamma.dist(alpha=nu / 2, beta=0.5), value)
+    def dist(cls, nu, **kwargs):
+        return Gamma.dist(alpha=nu / 2, beta=1 / 2, **kwargs)
 
 
 # TODO: Remove this once logp for multiplication is working!

@@ -40,7 +40,7 @@ from pytensor.tensor.variable import TensorConstant
 
 import pymc as pm
 
-from pymc import Deterministic, Potential
+from pymc import Deterministic, Model, Potential
 from pymc.blocking import DictToArrayBijection, RaveledVars
 from pymc.distributions import Normal, transforms
 from pymc.distributions.distribution import PartialObservedRV
@@ -222,6 +222,14 @@ class TestObserved:
 
         assert x1.type.dtype == X.type.dtype
         assert x2.type.dtype == X.type.dtype
+
+    @pytensor.config.change_flags(compute_test_value="raise")
+    def test_observed_compute_test_value(self):
+        data = np.zeros(100)
+        with pm.Model():
+            obs = pm.Normal("obs", mu=pt.zeros_like(data), sigma=1, observed=data)
+        assert obs.tag.test_value.shape == data.shape
+        assert obs.tag.test_value.dtype == data.dtype
 
 
 def test_duplicate_vars():
@@ -697,9 +705,9 @@ def test_set_initval():
         alpha = pm.HalfNormal("alpha", initval=100)
         value = pm.NegativeBinomial("value", mu=mu, alpha=alpha)
 
-    assert np.array_equal(model.initial_values[mu], np.array([[100.0]]))
-    np.testing.assert_array_equal(model.initial_values[alpha], np.array(100))
-    assert model.initial_values[value] is None
+    assert np.array_equal(model.rvs_to_initial_values[mu], np.array([[100.0]]))
+    np.testing.assert_array_equal(model.rvs_to_initial_values[alpha], np.array(100))
+    assert model.rvs_to_initial_values[value] is None
 
     # `Flat` cannot be sampled, so let's make sure that doesn't break initial
     # value computations
@@ -707,7 +715,7 @@ def test_set_initval():
         x = pm.Flat("x")
         y = pm.Normal("y", x, 1)
 
-    assert y in model.initial_values
+    assert y in model.rvs_to_initial_values
 
 
 def test_datalogp_multiple_shapes():
@@ -966,18 +974,6 @@ def test_set_data_constant_shape_error():
         pmodel.set_data("y", np.arange(10))
 
 
-def test_model_deprecation_warning():
-    with pm.Model() as m:
-        x = pm.Normal("x", 0, 1, size=2)
-        y = pm.LogNormal("y", 0, 1, size=2)
-
-    with pytest.warns(FutureWarning):
-        m.disc_vars
-
-    with pytest.warns(FutureWarning):
-        m.cont_vars
-
-
 @pytest.mark.parametrize("jacobian", [True, False])
 def test_model_logp(jacobian):
     with pm.Model() as m:
@@ -1106,9 +1102,18 @@ def test_compile_fn():
 
 def test_model_pytensor_config():
     assert pytensor.config.mode != "JAX"
-    with pm.Model(pytensor_config=dict(mode="JAX")) as model:
+    with pytest.warns(FutureWarning, match="pytensor_config is deprecated"):
+        m = pm.Model(pytensor_config=dict(mode="JAX"))
+    with m:
         assert pytensor.config.mode == "JAX"
     assert pytensor.config.mode != "JAX"
+
+
+def test_deprecated_model_property():
+    m = pm.Model()
+    with pytest.warns(FutureWarning, match="Model.model property is deprecated"):
+        m_property = m.model
+    assert m is m_property
 
 
 def test_model_parent_set_programmatically():
@@ -1515,6 +1520,18 @@ class TestImputationMissingData:
             model.compile_logp()({"x_unobserved": [0] * 3}),
             st.norm.logcdf(0) * 10,
         )
+
+    def test_truncated_normal(self):
+        """Test transform of unobserved TruncatedNormal leads to finite logp.
+
+        Regression test for #6999
+        """
+        with Model() as m:
+            mu = pm.TruncatedNormal("mu", mu=1, sigma=2, lower=0)
+            x = pm.TruncatedNormal(
+                "x", mu=mu, sigma=0.5, lower=0, observed=np.array([0.1, 0.2, 0.5, np.nan, np.nan])
+            )
+        m.check_start_vals(m.initial_point())
 
 
 class TestShared:
